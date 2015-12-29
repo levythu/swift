@@ -20,6 +20,7 @@ import os
 import random
 from tempfile import mkdtemp
 from shutil import rmtree
+from eventlet import Timeout
 
 from swift.common.utils import normalize_timestamp
 from swift.container import auditor
@@ -90,8 +91,14 @@ class TestAuditor(unittest.TestCase):
             with mock.patch('swift.container.auditor.audit_location_generator',
                             fake_audit_location_generator):
                 self.assertRaises(ValueError, test_auditor.run_forever)
-        self.assertEquals(test_auditor.container_failures, 2 * call_times)
-        self.assertEquals(test_auditor.container_passes, 3 * call_times)
+        self.assertEqual(test_auditor.container_failures, 2 * call_times)
+        self.assertEqual(test_auditor.container_passes, 3 * call_times)
+
+        # now force timeout path code coverage
+        with mock.patch('swift.container.auditor.ContainerAuditor.'
+                        '_one_audit_pass', side_effect=Timeout()):
+            with mock.patch('swift.container.auditor.time', FakeTime()):
+                self.assertRaises(ValueError, test_auditor.run_forever)
 
     @mock.patch('swift.container.auditor.ContainerBroker', FakeContainerBroker)
     def test_run_once(self):
@@ -105,8 +112,25 @@ class TestAuditor(unittest.TestCase):
         with mock.patch('swift.container.auditor.audit_location_generator',
                         fake_audit_location_generator):
             test_auditor.run_once()
-        self.assertEquals(test_auditor.container_failures, 2)
-        self.assertEquals(test_auditor.container_passes, 3)
+        self.assertEqual(test_auditor.container_failures, 2)
+        self.assertEqual(test_auditor.container_passes, 3)
+
+    @mock.patch('swift.container.auditor.ContainerBroker', FakeContainerBroker)
+    def test_one_audit_pass(self):
+        conf = {}
+        test_auditor = auditor.ContainerAuditor(conf, logger=self.logger)
+
+        def fake_audit_location_generator(*args, **kwargs):
+            files = sorted(os.listdir(self.testdir))
+            return [(os.path.join(self.testdir, f), '', '') for f in files]
+
+        # force code coverage for logging path
+        test_auditor.logging_interval = 0
+        with mock.patch('swift.container.auditor.audit_location_generator',
+                        fake_audit_location_generator):
+            test_auditor._one_audit_pass(test_auditor.logging_interval)
+        self.assertEqual(test_auditor.container_failures, 1)
+        self.assertEqual(test_auditor.container_passes, 3)
 
     @mock.patch('swift.container.auditor.ContainerBroker', FakeContainerBroker)
     def test_container_auditor(self):
@@ -116,8 +140,8 @@ class TestAuditor(unittest.TestCase):
         for f in files:
             path = os.path.join(self.testdir, f)
             test_auditor.container_audit(path)
-        self.assertEquals(test_auditor.container_failures, 2)
-        self.assertEquals(test_auditor.container_passes, 3)
+        self.assertEqual(test_auditor.container_failures, 2)
+        self.assertEqual(test_auditor.container_passes, 3)
 
 
 class TestAuditorMigrations(unittest.TestCase):
@@ -136,8 +160,8 @@ class TestAuditorMigrations(unittest.TestCase):
                 conn.execute('SELECT storage_policy_index '
                              'FROM container_stat')
             except Exception as err:
-                self.assert_('no such column: storage_policy_index' in
-                             str(err))
+                self.assertTrue('no such column: storage_policy_index' in
+                                str(err))
             else:
                 self.fail('TestContainerBrokerBeforeSPI broker class '
                           'was already migrated')

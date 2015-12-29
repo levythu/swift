@@ -15,12 +15,12 @@
 
 """ In-Memory Disk File Interface for Swift Object Server"""
 
-import cStringIO
 import time
 import hashlib
 from contextlib import contextmanager
 
 from eventlet import Timeout
+from six import moves
 
 from swift.common.utils import Timestamp
 from swift.common.exceptions import DiskFileQuarantined, DiskFileNotExist, \
@@ -254,6 +254,7 @@ class DiskFile(object):
         self._metadata = None
         self._fp = None
         self._filesystem = fs
+        self.fragments = None
 
     def open(self):
         """
@@ -385,7 +386,7 @@ class DiskFile(object):
                      disk
         :raises DiskFileNoSpace: if a size is specified and allocation fails
         """
-        fp = cStringIO.StringIO()
+        fp = moves.cStringIO()
         try:
             yield DiskFileWriter(self._filesystem, self._name, fp)
         finally:
@@ -413,3 +414,13 @@ class DiskFile(object):
         fp, md = self._filesystem.get_object(self._name)
         if md and md['X-Timestamp'] < Timestamp(timestamp):
             self._filesystem.del_object(self._name)
+
+    @property
+    def timestamp(self):
+        if self._metadata is None:
+            raise DiskFileNotOpen()
+        return Timestamp(self._metadata.get('X-Timestamp'))
+
+    data_timestamp = timestamp
+
+    durable_timestamp = timestamp

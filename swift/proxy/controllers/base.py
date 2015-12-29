@@ -24,17 +24,20 @@
 #   These shenanigans are to ensure all related objects can be garbage
 # collected. We've seen objects hang around forever otherwise.
 
+from six.moves.urllib.parse import quote
+
 import os
 import time
 import functools
 import inspect
+import itertools
 import operator
 from sys import exc_info
 from swift import gettext_ as _
-from urllib import quote
 
 from eventlet import sleep
 from eventlet.timeout import Timeout
+import six
 
 from swift.common.wsgi import make_pre_authed_env
 from swift.common.utils import Timestamp, config_true_value, \
@@ -49,7 +52,8 @@ from swift.common.http import is_informational, is_success, is_redirection, \
     HTTP_BAD_REQUEST, HTTP_NOT_FOUND, HTTP_SERVICE_UNAVAILABLE, \
     HTTP_INSUFFICIENT_STORAGE, HTTP_UNAUTHORIZED, HTTP_CONTINUE
 from swift.common.swob import Request, Response, HeaderKeyDict, Range, \
-    HTTPException, HTTPRequestedRangeNotSatisfiable, HTTPServiceUnavailable
+    HTTPException, HTTPRequestedRangeNotSatisfiable, HTTPServiceUnavailable, \
+    status_map
 from swift.common.request_helpers import strip_sys_meta_prefix, \
     strip_user_meta_prefix, is_user_meta, is_sys_meta, is_sys_or_user_meta
 from swift.common.storage_policy import POLICIES
@@ -231,17 +235,17 @@ def cors_validation(func):
             #  - headers provided by the user in
             #    x-container-meta-access-control-expose-headers
             if 'Access-Control-Expose-Headers' not in resp.headers:
-                expose_headers = [
+                expose_headers = set([
                     'cache-control', 'content-language', 'content-type',
                     'expires', 'last-modified', 'pragma', 'etag',
-                    'x-timestamp', 'x-trans-id']
+                    'x-timestamp', 'x-trans-id'])
                 for header in resp.headers:
                     if header.startswith('X-Container-Meta') or \
                             header.startswith('X-Object-Meta'):
-                        expose_headers.append(header.lower())
+                        expose_headers.add(header.lower())
                 if cors_info.get('expose_headers'):
-                    expose_headers.extend(
-                        [header_line.strip()
+                    expose_headers = expose_headers.union(
+                        [header_line.strip().lower()
                          for header_line in
                          cors_info['expose_headers'].split(' ')
                          if header_line.strip()])
@@ -313,6 +317,7 @@ def get_account_info(env, app, swift_source=None):
 
         This call bypasses auth. Success does not imply that the request has
         authorization to the account.
+
     :raises ValueError: when path can't be split(path, 2, 4)
     """
     (version, account, _junk, _junk) = \
@@ -332,9 +337,10 @@ def _get_cache_key(account, container):
     """
     Get the keys for both memcache (cache_key) and env (env_key)
     where info about accounts and containers is cached
+
     :param   account: The name of the account
     :param container: The name of the container (or None if account)
-    :returns a tuple of (cache_key, env_key)
+    :returns: a tuple of (cache_key, env_key)
     """
 
     if container:
@@ -352,10 +358,11 @@ def _get_cache_key(account, container):
 def get_object_env_key(account, container, obj):
     """
     Get the keys for env (env_key) where info about object is cached
+
     :param   account: The name of the account
     :param container: The name of the container
     :param obj: The name of the object
-    :returns a string env_key
+    :returns: a string env_key
     """
     env_key = 'swift.object/%s/%s/%s' % (account,
                                          container, obj)
@@ -456,7 +463,7 @@ def _get_info_cache(app, env, account, container=None):
 
     :param  app: the application object
     :param  env: the environment used by the current request
-    :returns the cached info or None if not cached
+    :returns: the cached info or None if not cached
     """
 
     cache_key, env_key = _get_cache_key(account, container)
@@ -467,7 +474,7 @@ def _get_info_cache(app, env, account, container=None):
         info = memcache.get(cache_key)
         if info:
             for key in info:
-                if isinstance(info[key], unicode):
+                if isinstance(info[key], six.text_type):
                     info[key] = info[key].encode("utf-8")
             env[env_key] = info
         return info
@@ -696,7 +703,12 @@ class ResumingGetter(object):
         If we have no Range header, this is a no-op.
         """
         if 'Range' in self.backend_headers:
-            req_range = Range(self.backend_headers['Range'])
+            try:
+                req_range = Range(self.backend_headers['Range'])
+            except ValueError:
+                # there's a Range header, but it's garbage, so get rid of it
+                self.backend_headers.pop('Range')
+                return
             begin, end = req_range.ranges.pop(0)
             if len(req_range.ranges) > 0:
                 self.backend_headers['Range'] = str(req_range)
@@ -822,11 +834,11 @@ class ResumingGetter(object):
                     except ChunkReadTimeout:
                         exc_type, exc_value, exc_traceback = exc_info()
                         if self.newest or self.server_type != 'Object':
-                            raise exc_type, exc_value, exc_traceback
+                            six.reraise(exc_type, exc_value, exc_traceback)
                         try:
                             self.fast_forward(bytes_used_from_backend)
                         except (HTTPException, ValueError):
-                            raise exc_type, exc_value, exc_traceback
+                            six.reraise(exc_type, exc_value, exc_traceback)
                         except RangeAlreadyComplete:
                             break
                         buf = ''
@@ -856,7 +868,7 @@ class ResumingGetter(object):
                                 # nothing more to do here.
                                 return
                         else:
-                            raise exc_type, exc_value, exc_traceback
+                            six.reraise(exc_type, exc_value, exc_traceback)
                     else:
                         if buf and self.skip_bytes:
                             if self.skip_bytes < len(buf):
@@ -922,20 +934,20 @@ class ResumingGetter(object):
                            'part_iter': part_iter}
                     self.pop_range()
             except StopIteration:
-                return
+                req.environ['swift.non_client_disconnect'] = True
 
         except ChunkReadTimeout:
             self.app.exception_occurred(node[0], _('Object'),
                                         _('Trying to read during GET'))
             raise
         except ChunkWriteTimeout:
-            self.app.logger.warn(
+            self.app.logger.warning(
                 _('Client did not read from proxy within %ss') %
                 self.app.client_timeout)
             self.app.logger.increment('client_timeouts')
         except GeneratorExit:
             if not req.environ.get('swift.non_client_disconnect'):
-                self.app.logger.warn(_('Client disconnected on read'))
+                self.app.logger.warning(_('Client disconnected on read'))
         except Exception:
             self.app.logger.exception(_('Trying to send to client'))
             raise
@@ -1016,7 +1028,7 @@ class ResumingGetter(object):
 
                     self.statuses.append(possible_source.status)
                     self.reasons.append(possible_source.reason)
-                    self.bodies.append('')
+                    self.bodies.append(None)
                     self.source_headers.append(possible_source.getheaders())
                     sources.append((possible_source, node))
                     if not self.newest:  # one good source is enough
@@ -1120,6 +1132,99 @@ class GetOrHeadHandler(ResumingGetter):
         return res
 
 
+class NodeIter(object):
+    """
+    Yields nodes for a ring partition, skipping over error
+    limited nodes and stopping at the configurable number of nodes. If a
+    node yielded subsequently gets error limited, an extra node will be
+    yielded to take its place.
+
+    Note that if you're going to iterate over this concurrently from
+    multiple greenthreads, you'll want to use a
+    swift.common.utils.GreenthreadSafeIterator to serialize access.
+    Otherwise, you may get ValueErrors from concurrent access. (You also
+    may not, depending on how logging is configured, the vagaries of
+    socket IO and eventlet, and the phase of the moon.)
+
+    :param app: a proxy app
+    :param ring: ring to get yield nodes from
+    :param partition: ring partition to yield nodes for
+    :param node_iter: optional iterable of nodes to try. Useful if you
+        want to filter or reorder the nodes.
+    """
+
+    def __init__(self, app, ring, partition, node_iter=None):
+        self.app = app
+        self.ring = ring
+        self.partition = partition
+
+        part_nodes = ring.get_part_nodes(partition)
+        if node_iter is None:
+            node_iter = itertools.chain(
+                part_nodes, ring.get_more_nodes(partition))
+        num_primary_nodes = len(part_nodes)
+        self.nodes_left = self.app.request_node_count(num_primary_nodes)
+        self.expected_handoffs = self.nodes_left - num_primary_nodes
+
+        # Use of list() here forcibly yanks the first N nodes (the primary
+        # nodes) from node_iter, so the rest of its values are handoffs.
+        self.primary_nodes = self.app.sort_nodes(
+            list(itertools.islice(node_iter, num_primary_nodes)))
+        self.handoff_iter = node_iter
+
+    def __iter__(self):
+        self._node_iter = self._node_gen()
+        return self
+
+    def log_handoffs(self, handoffs):
+        """
+        Log handoff requests if handoff logging is enabled and the
+        handoff was not expected.
+
+        We only log handoffs when we've pushed the handoff count further
+        than we would normally have expected under normal circumstances,
+        that is (request_node_count - num_primaries), when handoffs goes
+        higher than that it means one of the primaries must have been
+        skipped because of error limiting before we consumed all of our
+        nodes_left.
+        """
+        if not self.app.log_handoffs:
+            return
+        extra_handoffs = handoffs - self.expected_handoffs
+        if extra_handoffs > 0:
+            self.app.logger.increment('handoff_count')
+            self.app.logger.warning(
+                'Handoff requested (%d)' % handoffs)
+            if (extra_handoffs == len(self.primary_nodes)):
+                # all the primaries were skipped, and handoffs didn't help
+                self.app.logger.increment('handoff_all_count')
+
+    def _node_gen(self):
+        for node in self.primary_nodes:
+            if not self.app.error_limited(node):
+                yield node
+                if not self.app.error_limited(node):
+                    self.nodes_left -= 1
+                    if self.nodes_left <= 0:
+                        return
+        handoffs = 0
+        for node in self.handoff_iter:
+            if not self.app.error_limited(node):
+                handoffs += 1
+                self.log_handoffs(handoffs)
+                yield node
+                if not self.app.error_limited(node):
+                    self.nodes_left -= 1
+                    if self.nodes_left <= 0:
+                        return
+
+    def next(self):
+        return next(self._node_iter)
+
+    def __next__(self):
+        return self.next()
+
+
 class Controller(object):
     """Base WSGI controller class for the proxy"""
     server_type = 'Base'
@@ -1180,7 +1285,7 @@ class Controller(object):
     def generate_request_headers(self, orig_req=None, additional=None,
                                  transfer=False):
         """
-        Create a list of headers to be used in backend requets
+        Create a list of headers to be used in backend requests
 
         :param orig_req: the original request sent by the client to the proxy
         :param additional: additional headers to send to the backend
@@ -1442,7 +1547,6 @@ class Controller(object):
                 [(i, s) for i, s in enumerate(statuses)
                  if hundred <= s < hundred + 100]
             if len(hstatuses) >= quorum_size:
-                resp = Response(request=req)
                 try:
                     status_index, status = max(
                         ((i, stat) for i, stat in hstatuses
@@ -1451,6 +1555,7 @@ class Controller(object):
                 except ValueError:
                     # All statuses were indices to avoid
                     continue
+                resp = status_map[status](request=req)
                 resp.status = '%s %s' % (status, reasons[status_index])
                 resp.body = bodies[status_index]
                 if headers:

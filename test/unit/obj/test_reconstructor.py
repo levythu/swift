@@ -17,19 +17,20 @@ import unittest
 import os
 from hashlib import md5
 import mock
-import cPickle as pickle
+import six.moves.cPickle as pickle
 import tempfile
 import time
 import shutil
 import re
 import random
 import struct
-from eventlet import Timeout
+from eventlet import Timeout, sleep
 
-from contextlib import closing, nested, contextmanager
+from contextlib import closing, contextmanager
 from gzip import GzipFile
 from shutil import rmtree
 from swift.common import utils
+from swift.common.swob import HeaderKeyDict
 from swift.common.exceptions import DiskFileError
 from swift.obj import diskfile, reconstructor as object_reconstructor
 from swift.common import ring
@@ -38,7 +39,8 @@ from swift.common.storage_policy import (StoragePolicy, ECStoragePolicy,
 from swift.obj.reconstructor import REVERT
 
 from test.unit import (patch_policies, debug_logger, mocked_http_conn,
-                       FabricatedRing, make_timestamp_iter)
+                       FabricatedRing, make_timestamp_iter,
+                       DEFAULT_TEST_EC_TYPE)
 
 
 @contextmanager
@@ -130,7 +132,8 @@ def get_header_frag_index(self, body):
 
 
 @patch_policies([StoragePolicy(0, name='zero', is_default=True),
-                 ECStoragePolicy(1, name='one', ec_type='jerasure_rs_vand',
+                 ECStoragePolicy(1, name='one',
+                                 ec_type=DEFAULT_TEST_EC_TYPE,
                                  ec_ndata=2, ec_nparity=1)])
 class TestGlobalSetupObjectReconstructor(unittest.TestCase):
 
@@ -599,10 +602,74 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
             self.assertFalse(jobs)  # that should be all of them
         check_jobs(part_num)
 
-    def test_run_once(self):
-        with mocked_http_conn(*[200] * 12, body=pickle.dumps({})):
+    def _run_once(self, http_count, extra_devices, override_devices=None):
+        ring_devs = list(self.policy.object_ring.devs)
+        for device, parts in extra_devices.items():
+            device_path = os.path.join(self.devices, device)
+            os.mkdir(device_path)
+            for part in range(parts):
+                os.makedirs(os.path.join(device_path, 'objects-1', str(part)))
+            # we update the ring to make is_local happy
+            devs = [dict(d) for d in ring_devs]
+            for d in devs:
+                d['device'] = device
+            self.policy.object_ring.devs.extend(devs)
+        self.reconstructor.stats_interval = 0
+        self.process_job = lambda j: sleep(0)
+        with mocked_http_conn(*[200] * http_count, body=pickle.dumps({})):
             with mock_ssync_sender():
-                self.reconstructor.run_once()
+                self.reconstructor.run_once(devices=override_devices)
+
+    def test_run_once(self):
+        # sda1: 3 is done in setup
+        extra_devices = {
+            'sdb1': 4,
+            'sdc1': 1,
+            'sdd1': 0,
+        }
+        self._run_once(18, extra_devices)
+        stats_lines = set()
+        for line in self.logger.get_lines_for_level('info'):
+            if 'devices reconstructed in' not in line:
+                continue
+            stat_line = line.split('of', 1)[0].strip()
+            stats_lines.add(stat_line)
+        acceptable = set([
+            '0/3 (0.00%) partitions',
+            '8/8 (100.00%) partitions',
+        ])
+        matched = stats_lines & acceptable
+        self.assertEqual(matched, acceptable,
+                         'missing some expected acceptable:\n%s' % (
+                             '\n'.join(sorted(acceptable - matched))))
+        self.assertEqual(self.reconstructor.reconstruction_device_count, 4)
+        self.assertEqual(self.reconstructor.reconstruction_part_count, 8)
+        self.assertEqual(self.reconstructor.part_count, 8)
+
+    def test_run_once_override_devices(self):
+        # sda1: 3 is done in setup
+        extra_devices = {
+            'sdb1': 4,
+            'sdc1': 1,
+            'sdd1': 0,
+        }
+        self._run_once(2, extra_devices, 'sdc1')
+        stats_lines = set()
+        for line in self.logger.get_lines_for_level('info'):
+            if 'devices reconstructed in' not in line:
+                continue
+            stat_line = line.split('of', 1)[0].strip()
+            stats_lines.add(stat_line)
+        acceptable = set([
+            '1/1 (100.00%) partitions',
+        ])
+        matched = stats_lines & acceptable
+        self.assertEqual(matched, acceptable,
+                         'missing some expected acceptable:\n%s' % (
+                             '\n'.join(sorted(acceptable - matched))))
+        self.assertEqual(self.reconstructor.reconstruction_device_count, 1)
+        self.assertEqual(self.reconstructor.reconstruction_part_count, 1)
+        self.assertEqual(self.reconstructor.part_count, 1)
 
     def test_get_response(self):
         part = self.part_nums[0]
@@ -619,8 +686,22 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
                     self.assertEqual(
                         len(self.reconstructor.logger.log_dict['warning']), 1)
 
+    def test_reconstructor_does_not_log_on_404(self):
+        part = self.part_nums[0]
+        node = POLICIES[0].object_ring.get_part_nodes(int(part))[0]
+        with mocked_http_conn(404):
+            self.reconstructor._get_response(node, part,
+                                             path='some_path',
+                                             headers={},
+                                             policy=POLICIES[0])
+
+            # Make sure that no warnings are emitted for a 404
+            len_warning_lines = len(self.logger.get_lines_for_level('warning'))
+            self.assertEqual(len_warning_lines, 0)
+
     def test_reconstructor_skips_bogus_partition_dirs(self):
         # A directory in the wrong place shouldn't crash the reconstructor
+        self.reconstructor._reset_stats()
         rmtree(self.objects_1)
         os.mkdir(self.objects_1)
 
@@ -699,6 +780,7 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
         self.assertEqual(expected_partners, sorted(got_partners))
 
     def test_collect_parts(self):
+        self.reconstructor._reset_stats()
         parts = []
         for part_info in self.reconstructor.collect_parts():
             parts.append(part_info['partition'])
@@ -709,6 +791,7 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
         def blowup_mkdirs(path):
             raise OSError('Ow!')
 
+        self.reconstructor._reset_stats()
         with mock.patch.object(object_reconstructor, 'mkdirs', blowup_mkdirs):
             rmtree(self.objects_1, ignore_errors=1)
             parts = []
@@ -717,7 +800,7 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
             error_lines = self.logger.get_lines_for_level('error')
             self.assertEqual(len(error_lines), 1)
             log_args, log_kwargs = self.logger.log_dict['error'][0]
-            self.assertEquals(str(log_kwargs['exc_info'][1]), 'Ow!')
+            self.assertEqual(str(log_kwargs['exc_info'][1]), 'Ow!')
 
     def test_removes_zbf(self):
         # After running xfs_repair, a partition directory could become a
@@ -734,6 +817,7 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
         # since our collect_parts job is a generator, that yields directly
         # into build_jobs and then spawns it's safe to do the remove_files
         # without making reconstructor startup slow
+        self.reconstructor._reset_stats()
         for part_info in self.reconstructor.collect_parts():
             self.assertNotEqual(pol_1_part_1_path, part_info['part_path'])
         self.assertFalse(os.path.exists(pol_1_part_1_path))
@@ -758,8 +842,8 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
                     self.job['policy'], self.suffixes,
                     frag_index=self.job.get('frag_index'))
                 self.available_map = {}
-                for path, hash_, ts in hash_gen:
-                    self.available_map[hash_] = ts
+                for path, hash_, timestamps in hash_gen:
+                    self.available_map[hash_] = timestamps
                 context['available_map'] = self.available_map
                 ssync_calls.append(context)
 
@@ -978,25 +1062,24 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
 
     def test_process_job_all_timeout(self):
         self.reconstructor._reset_stats()
-        with mock_ssync_sender():
-            with nested(mocked_http_conn(*[Timeout()] * 8)):
-                found_jobs = []
-                for part_info in self.reconstructor.collect_parts():
-                    jobs = self.reconstructor.build_reconstruction_jobs(
-                        part_info)
-                    found_jobs.extend(jobs)
-                    for job in jobs:
-                        self.logger._clear()
-                        self.reconstructor.process_job(job)
-                        for line in self.logger.get_lines_for_level('error'):
-                            self.assertTrue('Timeout (Nones)' in line)
-                        self.assertStatCount(
-                            'update_stats', 'suffix.hashes', 0)
-                        self.assertStatCount(
-                            'update_stats', 'suffix.syncs', 0)
-            self.assertEqual(self.reconstructor.suffix_sync, 0)
-            self.assertEqual(self.reconstructor.suffix_count, 0)
-            self.assertEqual(len(found_jobs), 6)
+        with mock_ssync_sender(), mocked_http_conn(*[Timeout()] * 8):
+            found_jobs = []
+            for part_info in self.reconstructor.collect_parts():
+                jobs = self.reconstructor.build_reconstruction_jobs(
+                    part_info)
+                found_jobs.extend(jobs)
+                for job in jobs:
+                    self.logger._clear()
+                    self.reconstructor.process_job(job)
+                    for line in self.logger.get_lines_for_level('error'):
+                        self.assertTrue('Timeout (Nones)' in line)
+                    self.assertStatCount(
+                        'update_stats', 'suffix.hashes', 0)
+                    self.assertStatCount(
+                        'update_stats', 'suffix.syncs', 0)
+        self.assertEqual(self.reconstructor.suffix_sync, 0)
+        self.assertEqual(self.reconstructor.suffix_count, 0)
+        self.assertEqual(len(found_jobs), 6)
 
 
 @patch_policies(with_ec_default=True)
@@ -1033,6 +1116,7 @@ class TestObjectReconstructor(unittest.TestCase):
         self.reconstructor.job_count = 1
 
     def tearDown(self):
+        self.reconstructor._reset_stats()
         self.reconstructor.stats_line()
         shutil.rmtree(self.testdir)
 
@@ -1091,10 +1175,10 @@ class TestObjectReconstructor(unittest.TestCase):
             'replication_port': self.port,
         })
         self.reconstructor.bind_ip = '0.0.0.0'  # use whataremyips
-        with nested(mock.patch('swift.obj.reconstructor.whataremyips',
-                               return_value=[self.ip]),
-                    mock.patch.object(self.policy.object_ring, '_devs',
-                                      new=stub_ring_devs)):
+        with mock.patch('swift.obj.reconstructor.whataremyips',
+                        return_value=[self.ip]), \
+                mock.patch.object(self.policy.object_ring, '_devs',
+                                  new=stub_ring_devs):
             part_infos = list(self.reconstructor.collect_parts())
         found_parts = sorted(int(p['partition']) for p in part_infos)
         expected_parts = sorted(itertools.chain(
@@ -1143,10 +1227,10 @@ class TestObjectReconstructor(unittest.TestCase):
             'replication_port': self.port,
         })
         self.reconstructor.bind_ip = '0.0.0.0'  # use whataremyips
-        with nested(mock.patch('swift.obj.reconstructor.whataremyips',
-                               return_value=[self.ip]),
-                    mock.patch.object(self.policy.object_ring, '_devs',
-                                      new=stub_ring_devs)):
+        with mock.patch('swift.obj.reconstructor.whataremyips',
+                        return_value=[self.ip]), \
+                mock.patch.object(self.policy.object_ring, '_devs',
+                                  new=stub_ring_devs):
             part_infos = list(self.reconstructor.collect_parts())
         found_parts = sorted(int(p['partition']) for p in part_infos)
         expected_parts = sorted(itertools.chain(
@@ -1183,10 +1267,10 @@ class TestObjectReconstructor(unittest.TestCase):
             'replication_port': self.port,
         } for dev in local_devs]
         self.reconstructor.bind_ip = '0.0.0.0'  # use whataremyips
-        with nested(mock.patch('swift.obj.reconstructor.whataremyips',
-                               return_value=[self.ip]),
-                    mock.patch.object(self.policy.object_ring, '_devs',
-                                      new=stub_ring_devs)):
+        with mock.patch('swift.obj.reconstructor.whataremyips',
+                        return_value=[self.ip]), \
+                mock.patch.object(self.policy.object_ring, '_devs',
+                                  new=stub_ring_devs):
             part_infos = list(self.reconstructor.collect_parts())
         found_parts = sorted(int(p['partition']) for p in part_infos)
         expected_parts = sorted(itertools.chain(
@@ -1214,10 +1298,10 @@ class TestObjectReconstructor(unittest.TestCase):
             'replication_ip': self.ip,
             'replication_port': self.port
         } for dev in local_devs]
-        with nested(mock.patch('swift.obj.reconstructor.whataremyips',
-                               return_value=[self.ip]),
-                    mock.patch.object(self.policy.object_ring, '_devs',
-                                      new=stub_ring_devs)):
+        with mock.patch('swift.obj.reconstructor.whataremyips',
+                        return_value=[self.ip]), \
+                mock.patch.object(self.policy.object_ring, '_devs',
+                                  new=stub_ring_devs):
             part_infos = list(self.reconstructor.collect_parts())
         self.assertEqual(2, len(part_infos))  # sanity
         self.assertEqual(set(int(p['partition']) for p in part_infos),
@@ -1229,12 +1313,12 @@ class TestObjectReconstructor(unittest.TestCase):
             paths.append(os.path.join(devices, device))
             return False
 
-        with nested(mock.patch('swift.obj.reconstructor.whataremyips',
-                               return_value=[self.ip]),
-                    mock.patch.object(self.policy.object_ring, '_devs',
-                                      new=stub_ring_devs),
-                    mock.patch('swift.obj.diskfile.check_mount',
-                               fake_check_mount)):
+        with mock.patch('swift.obj.reconstructor.whataremyips',
+                        return_value=[self.ip]), \
+                mock.patch.object(self.policy.object_ring, '_devs',
+                                  new=stub_ring_devs), \
+                mock.patch('swift.obj.diskfile.check_mount',
+                           fake_check_mount):
             part_infos = list(self.reconstructor.collect_parts())
         self.assertEqual(2, len(part_infos))  # sanity, same jobs
         self.assertEqual(set(int(p['partition']) for p in part_infos),
@@ -1248,12 +1332,12 @@ class TestObjectReconstructor(unittest.TestCase):
         self.assertTrue(self.reconstructor.mount_check)
         for policy in POLICIES:
             self.assertTrue(self.reconstructor._df_router[policy].mount_check)
-        with nested(mock.patch('swift.obj.reconstructor.whataremyips',
-                               return_value=[self.ip]),
-                    mock.patch.object(self.policy.object_ring, '_devs',
-                                      new=stub_ring_devs),
-                    mock.patch('swift.obj.diskfile.check_mount',
-                               fake_check_mount)):
+        with mock.patch('swift.obj.reconstructor.whataremyips',
+                        return_value=[self.ip]), \
+                mock.patch.object(self.policy.object_ring, '_devs',
+                                  new=stub_ring_devs), \
+                mock.patch('swift.obj.diskfile.check_mount',
+                           fake_check_mount):
             part_infos = list(self.reconstructor.collect_parts())
         self.assertEqual([], part_infos)  # sanity, no jobs
 
@@ -1268,12 +1352,12 @@ class TestObjectReconstructor(unittest.TestCase):
             else:
                 return False
 
-        with nested(mock.patch('swift.obj.reconstructor.whataremyips',
-                               return_value=[self.ip]),
-                    mock.patch.object(self.policy.object_ring, '_devs',
-                                      new=stub_ring_devs),
-                    mock.patch('swift.obj.diskfile.check_mount',
-                               fake_check_mount)):
+        with mock.patch('swift.obj.reconstructor.whataremyips',
+                        return_value=[self.ip]), \
+                mock.patch.object(self.policy.object_ring, '_devs',
+                                  new=stub_ring_devs), \
+                mock.patch('swift.obj.diskfile.check_mount',
+                           fake_check_mount):
             part_infos = list(self.reconstructor.collect_parts())
         self.assertEqual(1, len(part_infos))  # only sda picked up (part 0)
         self.assertEqual(part_infos[0]['partition'], 0)
@@ -1290,14 +1374,14 @@ class TestObjectReconstructor(unittest.TestCase):
         fake_unlink = mock.MagicMock()
         self.reconstructor.reclaim_age = 1000
         now = time.time()
-        with nested(mock.patch('swift.obj.reconstructor.whataremyips',
-                               return_value=[self.ip]),
-                    mock.patch('swift.obj.reconstructor.time.time',
-                               return_value=now),
-                    mock.patch.object(self.policy.object_ring, '_devs',
-                                      new=stub_ring_devs),
-                    mock.patch('swift.obj.reconstructor.unlink_older_than',
-                               fake_unlink)):
+        with mock.patch('swift.obj.reconstructor.whataremyips',
+                        return_value=[self.ip]), \
+                mock.patch('swift.obj.reconstructor.time.time',
+                           return_value=now), \
+                mock.patch.object(self.policy.object_ring, '_devs',
+                                  new=stub_ring_devs), \
+                mock.patch('swift.obj.reconstructor.unlink_older_than',
+                           fake_unlink):
             self.assertEqual([], list(self.reconstructor.collect_parts()))
         # each local device hash unlink_older_than called on it,
         # with now - self.reclaim_age
@@ -1323,10 +1407,10 @@ class TestObjectReconstructor(unittest.TestCase):
         datadir_path = os.path.join(self.devices, self.local_dev['device'],
                                     diskfile.get_data_dir(self.policy))
         utils.mkdirs(os.path.dirname(datadir_path))
-        with nested(mock.patch('swift.obj.reconstructor.whataremyips',
-                               return_value=[self.ip]),
-                    mock.patch('swift.obj.reconstructor.mkdirs',
-                               side_effect=OSError('kaboom!'))):
+        with mock.patch('swift.obj.reconstructor.whataremyips',
+                        return_value=[self.ip]), \
+                mock.patch('swift.obj.reconstructor.mkdirs',
+                           side_effect=OSError('kaboom!')):
             self.assertEqual([], list(self.reconstructor.collect_parts()))
         error_lines = self.logger.get_lines_for_level('error')
         self.assertEqual(len(error_lines), 1)
@@ -1428,10 +1512,10 @@ class TestObjectReconstructor(unittest.TestCase):
                 ('sda', 843),
             ]),
         )
-        with nested(mock.patch('swift.obj.reconstructor.whataremyips',
-                               return_value=[self.ip]),
-                    mock.patch.object(self.policy.object_ring, '_devs',
-                                      new=stub_ring_devs)):
+        with mock.patch('swift.obj.reconstructor.whataremyips',
+                        return_value=[self.ip]), \
+            mock.patch.object(self.policy.object_ring, '_devs',
+                              new=stub_ring_devs):
             for kwargs, expected_parts in expected:
                 part_infos = list(self.reconstructor.collect_parts(**kwargs))
                 expected_paths = set(
@@ -1768,12 +1852,11 @@ class TestObjectReconstructor(unittest.TestCase):
 
         ssync_calls = []
 
-        with nested(
-                mock_ssync_sender(ssync_calls),
+        with mock_ssync_sender(ssync_calls), \
                 mock.patch('swift.obj.diskfile.ECDiskFileManager._get_hashes',
-                           return_value=(None, stub_hashes))):
-            with mocked_http_conn(*codes, body_iter=body_iter) as request_log:
-                self.reconstructor.process_job(job)
+                           return_value=(None, stub_hashes)), \
+                mocked_http_conn(*codes, body_iter=body_iter) as request_log:
+            self.reconstructor.process_job(job)
 
         expected_suffix_calls = set([
             ('10.0.0.1', '/sdb/0'),
@@ -1821,12 +1904,11 @@ class TestObjectReconstructor(unittest.TestCase):
         codes, body_iter = zip(*responses)
 
         ssync_calls = []
-        with nested(
-                mock_ssync_sender(ssync_calls),
+        with mock_ssync_sender(ssync_calls), \
                 mock.patch('swift.obj.diskfile.ECDiskFileManager._get_hashes',
-                           return_value=(None, stub_hashes))):
-            with mocked_http_conn(*codes, body_iter=body_iter) as request_log:
-                self.reconstructor.process_job(job)
+                           return_value=(None, stub_hashes)), \
+                mocked_http_conn(*codes, body_iter=body_iter) as request_log:
+            self.reconstructor.process_job(job)
 
         expected_suffix_calls = set([
             ('10.0.0.1', '/sdb/0'),
@@ -1892,12 +1974,11 @@ class TestObjectReconstructor(unittest.TestCase):
         codes, body_iter = zip(*responses)
 
         ssync_calls = []
-        with nested(
-                mock_ssync_sender(ssync_calls),
+        with mock_ssync_sender(ssync_calls), \
                 mock.patch('swift.obj.diskfile.ECDiskFileManager._get_hashes',
-                           return_value=(None, stub_hashes))):
-            with mocked_http_conn(*codes, body_iter=body_iter) as request_log:
-                self.reconstructor.process_job(job)
+                           return_value=(None, stub_hashes)), \
+                mocked_http_conn(*codes, body_iter=body_iter) as request_log:
+            self.reconstructor.process_job(job)
 
         expected_suffix_calls = set([
             ('10.0.0.1', '/sdb/0'),
@@ -1958,12 +2039,11 @@ class TestObjectReconstructor(unittest.TestCase):
 
         ssync_calls = []
 
-        with nested(
-                mock_ssync_sender(ssync_calls),
+        with mock_ssync_sender(ssync_calls), \
                 mock.patch('swift.obj.diskfile.ECDiskFileManager._get_hashes',
-                           return_value=(None, stub_hashes))):
-            with mocked_http_conn(*codes, body_iter=body_iter) as request_log:
-                self.reconstructor.process_job(job)
+                           return_value=(None, stub_hashes)), \
+                mocked_http_conn(*codes, body_iter=body_iter) as request_log:
+            self.reconstructor.process_job(job)
 
         expected_suffix_calls = set([
             ('10.0.0.1', '/sdb/0'),
@@ -2031,14 +2111,13 @@ class TestObjectReconstructor(unittest.TestCase):
             ])
 
         ssync_calls = []
-        with nested(
-                mock_ssync_sender(ssync_calls,
-                                  response_callback=ssync_response_callback),
+        with mock_ssync_sender(ssync_calls,
+                               response_callback=ssync_response_callback), \
                 mock.patch('swift.obj.diskfile.ECDiskFileManager._get_hashes',
-                           return_value=(None, stub_hashes))):
-            with mocked_http_conn(*[200] * len(expected_suffix_calls),
-                                  body=pickle.dumps({})) as request_log:
-                self.reconstructor.process_job(job)
+                           return_value=(None, stub_hashes)), \
+                mocked_http_conn(*[200] * len(expected_suffix_calls),
+                                 body=pickle.dumps({})) as request_log:
+            self.reconstructor.process_job(job)
 
         found_suffix_calls = set((r['ip'], r['path'])
                                  for r in request_log.requests)
@@ -2093,12 +2172,11 @@ class TestObjectReconstructor(unittest.TestCase):
                  for r in expected_suffix_calls]
 
         ssync_calls = []
-        with nested(
-                mock_ssync_sender(ssync_calls),
+        with mock_ssync_sender(ssync_calls), \
                 mock.patch('swift.obj.diskfile.ECDiskFileManager._get_hashes',
-                           return_value=(None, stub_hashes))):
-            with mocked_http_conn(*codes) as request_log:
-                self.reconstructor.process_job(job)
+                           return_value=(None, stub_hashes)), \
+                mocked_http_conn(*codes) as request_log:
+            self.reconstructor.process_job(job)
 
         found_suffix_calls = set((r['ip'], r['path'])
                                  for r in request_log.requests)
@@ -2134,12 +2212,11 @@ class TestObjectReconstructor(unittest.TestCase):
         }
 
         ssync_calls = []
-        with nested(
-                mock_ssync_sender(ssync_calls),
+        with mock_ssync_sender(ssync_calls), \
                 mock.patch('swift.obj.diskfile.ECDiskFileManager._get_hashes',
-                           return_value=(None, stub_hashes))):
-            with mocked_http_conn(200, body=pickle.dumps({})) as request_log:
-                self.reconstructor.process_job(job)
+                           return_value=(None, stub_hashes)), \
+                mocked_http_conn(200, body=pickle.dumps({})) as request_log:
+            self.reconstructor.process_job(job)
 
         expected_suffix_calls = set([
             (sync_to[0]['ip'], '/%s/0/123-abc' % sync_to[0]['device']),
@@ -2196,14 +2273,13 @@ class TestObjectReconstructor(unittest.TestCase):
         ])
 
         ssync_calls = []
-        with nested(
-                mock_ssync_sender(ssync_calls,
-                                  response_callback=ssync_response_callback),
+        with mock_ssync_sender(ssync_calls,
+                               response_callback=ssync_response_callback), \
                 mock.patch('swift.obj.diskfile.ECDiskFileManager._get_hashes',
-                           return_value=(None, stub_hashes))):
-            with mocked_http_conn(*[200] * len(expected_suffix_calls),
-                                  body=pickle.dumps({})) as request_log:
-                self.reconstructor.process_job(job)
+                           return_value=(None, stub_hashes)), \
+                mocked_http_conn(*[200] * len(expected_suffix_calls),
+                                 body=pickle.dumps({})) as request_log:
+            self.reconstructor.process_job(job)
 
         found_suffix_calls = set((r['ip'], r['path'])
                                  for r in request_log.requests)
@@ -2256,14 +2332,13 @@ class TestObjectReconstructor(unittest.TestCase):
         ])
 
         ssync_calls = []
-        with nested(
-                mock_ssync_sender(ssync_calls,
-                                  response_callback=ssync_response_callback),
+        with mock_ssync_sender(ssync_calls,
+                               response_callback=ssync_response_callback), \
                 mock.patch('swift.obj.diskfile.ECDiskFileManager._get_hashes',
-                           return_value=(None, stub_hashes))):
-            with mocked_http_conn(*[200] * len(expected_suffix_calls),
-                                  body=pickle.dumps({})) as request_log:
-                self.reconstructor.process_job(job)
+                           return_value=(None, stub_hashes)), \
+                mocked_http_conn(*[200] * len(expected_suffix_calls),
+                                 body=pickle.dumps({})) as request_log:
+            self.reconstructor.process_job(job)
 
         found_suffix_calls = set((r['ip'], r['path'])
                                  for r in request_log.requests)
@@ -2320,7 +2395,7 @@ class TestObjectReconstructor(unittest.TestCase):
         }
 
         def ssync_response_callback(*args):
-            return True, {ohash: ts}
+            return True, {ohash: {'ts_data': ts}}
 
         ssync_calls = []
         with mock_ssync_sender(ssync_calls,
@@ -2346,11 +2421,8 @@ class TestObjectReconstructor(unittest.TestCase):
         self.assertFalse(os.access(df._datadir, os.F_OK))
 
     def test_process_job_revert_cleanup_tombstone(self):
-        replicas = self.policy.object_ring.replicas
-        frag_index = random.randint(0, replicas - 1)
         sync_to = [random.choice([n for n in self.policy.object_ring.devs
                                   if n != self.local_dev])]
-        sync_to[0]['index'] = frag_index
         partition = 0
 
         part_path = os.path.join(self.devices, self.local_dev['device'],
@@ -2368,7 +2440,7 @@ class TestObjectReconstructor(unittest.TestCase):
 
         job = {
             'job_type': object_reconstructor.REVERT,
-            'frag_index': frag_index,
+            'frag_index': None,
             'suffixes': [suffix],
             'sync_to': sync_to,
             'partition': partition,
@@ -2379,7 +2451,7 @@ class TestObjectReconstructor(unittest.TestCase):
         }
 
         def ssync_response_callback(*args):
-            return True, {ohash: ts}
+            return True, {ohash: {'ts_data': ts}}
 
         ssync_calls = []
         with mock_ssync_sender(ssync_calls,
@@ -2421,14 +2493,34 @@ class TestObjectReconstructor(unittest.TestCase):
             headers.update({'X-Object-Sysmeta-Ec-Etag': etag})
             responses.append((200, body, headers))
 
+        # make a hook point at
+        # swift.obj.reconstructor.ObjectReconstructor._get_response
+        called_headers = []
+        orig_func = object_reconstructor.ObjectReconstructor._get_response
+
+        def _get_response_hook(self, node, part, path, headers, policy):
+            called_headers.append(headers)
+            return orig_func(self, node, part, path, headers, policy)
+
         codes, body_iter, headers = zip(*responses)
-        with mocked_http_conn(*codes, body_iter=body_iter, headers=headers):
-            df = self.reconstructor.reconstruct_fa(
-                job, node, metadata)
-            fixed_body = ''.join(df.reader())
-            self.assertEqual(len(fixed_body), len(broken_body))
-            self.assertEqual(md5(fixed_body).hexdigest(),
-                             md5(broken_body).hexdigest())
+        get_response_path = \
+            'swift.obj.reconstructor.ObjectReconstructor._get_response'
+        with mock.patch(get_response_path, _get_response_hook):
+            with mocked_http_conn(
+                    *codes, body_iter=body_iter, headers=headers):
+                df = self.reconstructor.reconstruct_fa(
+                    job, node, metadata)
+                fixed_body = ''.join(df.reader())
+                self.assertEqual(len(fixed_body), len(broken_body))
+                self.assertEqual(md5(fixed_body).hexdigest(),
+                                 md5(broken_body).hexdigest())
+                for called_header in called_headers:
+                    called_header = HeaderKeyDict(called_header)
+                    self.assertTrue('Content-Length' in called_header)
+                    self.assertEqual(called_header['Content-Length'], '0')
+                    self.assertTrue('User-Agent' in called_header)
+                    user_agent = called_header['User-Agent']
+                    self.assertTrue(user_agent.startswith('obj-reconstructor'))
 
     def test_reconstruct_fa_errors_works(self):
         job = {

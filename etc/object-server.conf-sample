@@ -60,6 +60,8 @@ bind_port = 6000
 # conn_timeout = 0.5
 # Time to wait while sending each chunk of data to another backend node.
 # node_timeout = 3
+# Time to wait while sending a container update on object update.
+# container_update_timeout = 1.0
 # Time to wait while receiving each chunk of data from a client or another
 # backend node.
 # client_timeout = 60
@@ -160,7 +162,6 @@ use = egg:swift#recon
 # log_level = INFO
 # log_address = /dev/log
 #
-# vm_test_mode = no
 # daemonize = on
 #
 # Time in seconds to wait between replication passes
@@ -171,10 +172,7 @@ use = egg:swift#recon
 # concurrency = 1
 # stats_interval = 300
 #
-# The sync method to use; default is rsync but you can use ssync to try the
-# EXPERIMENTAL all-swift-code-no-rsync-callouts method. Once ssync is verified
-# as having performance comparable to, or better than, rsync, we plan to
-# deprecate rsync so we can move on with more features for replication.
+# default is rsync, alternative is ssync
 # sync_method = rsync
 #
 # max duration of a partition rsync
@@ -192,6 +190,10 @@ use = egg:swift#recon
 # NOTE: Objects that are already compressed (for example: .tar.gz, .mp3) might
 # slow down the syncing process.
 # rsync_compress = no
+#
+# Format of the rysnc module where the replicator will send data. See
+# etc/rsyncd.conf-sample for some usage examples.
+# rsync_module = {replication_ip}::object
 #
 # node_timeout = <whatever's in the DEFAULT section or 10>
 # max duration of an http request; this is for REPLICATE finalization calls and

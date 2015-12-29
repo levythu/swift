@@ -39,7 +39,7 @@ Installing dependencies
         sudo apt-get install curl gcc memcached rsync sqlite3 xfsprogs \
                              git-core libffi-dev python-setuptools
         sudo apt-get install python-coverage python-dev python-nose \
-                             python-simplejson python-xattr python-eventlet \
+                             python-xattr python-eventlet \
                              python-greenlet python-pastedeploy \
                              python-netifaces python-pip python-dnspython \
                              python-mock
@@ -50,14 +50,14 @@ Installing dependencies
         sudo yum install curl gcc memcached rsync sqlite xfsprogs git-core \
                          libffi-devel xinetd python-setuptools \
                          python-coverage python-devel python-nose \
-                         python-simplejson pyxattr python-eventlet \
+                         pyxattr python-eventlet \
                          python-greenlet python-paste-deploy \
                          python-netifaces python-pip python-dns \
                          python-mock
 
   Note: This installs necessary system dependencies and *most* of the python
   dependencies. Later in the process setuptools/distribute or pip will install
-  and/or upgrade packages. 
+  and/or upgrade packages.
 
 Next, choose either :ref:`partition-section` or :ref:`loopback-section`.
 
@@ -94,6 +94,16 @@ another device when creating the VM, and follow these instructions:
         sudo chown -R ${USER}:${USER} /var/run/swift
         # **Make sure to include the trailing slash after /srv/$x/**
         for x in {1..4}; do sudo chown -R ${USER}:${USER} /srv/$x/; done
+
+     Note: We create the mount points and mount the storage disk under
+     /mnt/sdb1. This disk will contain one directory per simulated swift node,
+     each owned by the current swift user.
+
+     We then create symlinks to these directories under /srv.
+     If the disk sdb is unmounted, files will not be written under
+     /srv/\*, because the symbolic link destination /mnt/sdb1/* will not
+     exist. This prevents disk sync operations from writing to the root
+     partition in the event a drive is unmounted.
 
   #. Next, skip to :ref:`common-dev-section`.
 
@@ -135,6 +145,15 @@ these instructions:
         # **Make sure to include the trailing slash after /srv/$x/**
         for x in {1..4}; do sudo chown -R ${USER}:${USER} /srv/$x/; done
 
+     Note: We create the mount points and mount the loopback file under
+     /mnt/sdb1. This file will contain one directory per simulated swift node,
+     each owned by the current swift user.
+
+     We then create symlinks to these directories under /srv.
+     If the loopback file is unmounted, files will not be written under
+     /srv/\*, because the symbolic link destination /mnt/sdb1/* will not
+     exist. This prevents disk sync operations from writing to the root
+     partition in the event a drive is unmounted.
 
 .. _common-dev-section:
 
@@ -352,6 +371,10 @@ commands are as follows:
 
      .. literalinclude:: /../saio/swift/container-reconciler.conf
 
+  #. ``/etc/swift/container-sync-realms.conf``
+
+     .. literalinclude:: /../saio/swift/container-sync-realms.conf
+
   #. ``/etc/swift/account-server/1.conf``
 
      .. literalinclude:: /../saio/swift/account-server/1.conf
@@ -427,11 +450,6 @@ Setting up scripts for running Swift
      /var/log/swift...`` line::
 
         sed -i "/find \/var\/log\/swift/d" $HOME/bin/resetswift
-
-     On Fedora, replace ``service <name> restart`` with ``systemctl restart
-     <name>.service``::
-
-        sed -i "s/service \(.*\) restart/systemctl restart \1.service/" $HOME/bin/resetswift
 
 
   #. Install the sample configuration file for running tests::

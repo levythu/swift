@@ -29,6 +29,7 @@ import sqlite3
 import itertools
 from contextlib import contextmanager
 import random
+import mock
 
 from swift.account.backend import AccountBroker
 from swift.common.utils import Timestamp
@@ -36,7 +37,7 @@ from test.unit import patch_policies, with_tempdir, make_timestamp_iter
 from swift.common.db import DatabaseConnectionError
 from swift.common.storage_policy import StoragePolicy, POLICIES
 
-from test.unit.common.test_db import TestExampleBroker
+from test.unit.common import test_db
 
 
 @patch_policies
@@ -52,9 +53,9 @@ class TestAccountBroker(unittest.TestCase):
                 pass
         except DatabaseConnectionError as e:
             self.assertTrue(hasattr(e, 'path'))
-            self.assertEquals(e.path, ':memory:')
+            self.assertEqual(e.path, ':memory:')
             self.assertTrue(hasattr(e, 'msg'))
-            self.assertEquals(e.msg, "DB doesn't exist")
+            self.assertEqual(e.msg, "DB doesn't exist")
         except Exception as e:
             self.fail("Unexpected exception raised: %r" % e)
         else:
@@ -64,6 +65,13 @@ class TestAccountBroker(unittest.TestCase):
             curs = conn.cursor()
             curs.execute('SELECT 1')
             self.assertEqual(curs.fetchall()[0][0], 1)
+
+    def test_initialize_fail(self):
+        broker = AccountBroker(':memory:')
+        with self.assertRaises(ValueError) as cm:
+            broker.initialize(Timestamp('1').internal)
+        self.assertEqual(str(cm.exception), 'Attempting to create a new'
+                         ' database with no account set')
 
     def test_exception(self):
         # Test AccountBroker throwing a conn away after exception
@@ -78,35 +86,35 @@ class TestAccountBroker(unittest.TestCase):
                 raise Exception('OMG')
         except Exception:
             pass
-        self.assert_(broker.conn is None)
+        self.assertTrue(broker.conn is None)
 
     def test_empty(self):
         # Test AccountBroker.empty
         broker = AccountBroker(':memory:', account='a')
         broker.initialize(Timestamp('1').internal)
-        self.assert_(broker.empty())
+        self.assertTrue(broker.empty())
         broker.put_container('o', Timestamp(time()).internal, 0, 0, 0,
                              POLICIES.default.idx)
-        self.assert_(not broker.empty())
+        self.assertTrue(not broker.empty())
         sleep(.00001)
         broker.put_container('o', 0, Timestamp(time()).internal, 0, 0,
                              POLICIES.default.idx)
-        self.assert_(broker.empty())
+        self.assertTrue(broker.empty())
 
     def test_is_status_deleted(self):
         # Test AccountBroker.is_status_deleted
         broker1 = AccountBroker(':memory:', account='a')
         broker1.initialize(Timestamp(time()).internal)
-        self.assert_(not broker1.is_status_deleted())
+        self.assertTrue(not broker1.is_status_deleted())
         broker1.delete_db(Timestamp(time()).internal)
-        self.assert_(broker1.is_status_deleted())
+        self.assertTrue(broker1.is_status_deleted())
         broker2 = AccountBroker(':memory:', account='a')
         broker2.initialize(Timestamp(time()).internal)
         # Set delete_timestamp greater than put_timestamp
         broker2.merge_timestamps(
             time(), Timestamp(time()).internal,
             Timestamp(time() + 999).internal)
-        self.assert_(broker2.is_status_deleted())
+        self.assertTrue(broker2.is_status_deleted())
 
     def test_reclaim(self):
         broker = AccountBroker(':memory:', account='test_account')
@@ -160,23 +168,9 @@ class TestAccountBroker(unittest.TestCase):
         broker.put_container('y', 0, 0, 0, 0, POLICIES.default.idx)
         broker.put_container('z', 0, 0, 0, 0, POLICIES.default.idx)
         broker.reclaim(Timestamp(time()).internal, time())
-        # self.assertEqual(len(res), 2)
-        # self.assert_(isinstance(res, tuple))
-        # containers, account_name = res
-        # self.assert_(containers is None)
-        # self.assert_(account_name is None)
         # Now delete the account
         broker.delete_db(Timestamp(time()).internal)
         broker.reclaim(Timestamp(time()).internal, time())
-        # self.assertEqual(len(res), 2)
-        # self.assert_(isinstance(res, tuple))
-        # containers, account_name = res
-        # self.assertEqual(account_name, 'test_account')
-        # self.assertEqual(len(containers), 3)
-        # self.assert_('x' in containers)
-        # self.assert_('y' in containers)
-        # self.assert_('z' in containers)
-        # self.assert_('a' not in containers)
 
     def test_delete_db_status(self):
         ts = (Timestamp(t).internal for t in itertools.count(int(time())))
@@ -185,7 +179,7 @@ class TestAccountBroker(unittest.TestCase):
         broker.initialize(start)
         info = broker.get_info()
         self.assertEqual(info['put_timestamp'], Timestamp(start).internal)
-        self.assert_(Timestamp(info['created_at']) >= start)
+        self.assertTrue(Timestamp(info['created_at']) >= start)
         self.assertEqual(info['delete_timestamp'], '0')
         if self.__class__ == TestAccountBrokerBeforeMetadata:
             self.assertEqual(info['status_changed_at'], '0')
@@ -198,7 +192,7 @@ class TestAccountBroker(unittest.TestCase):
         broker.delete_db(delete_timestamp)
         info = broker.get_info()
         self.assertEqual(info['put_timestamp'], Timestamp(start).internal)
-        self.assert_(Timestamp(info['created_at']) >= start)
+        self.assertTrue(Timestamp(info['created_at']) >= start)
         self.assertEqual(info['delete_timestamp'], delete_timestamp)
         self.assertEqual(info['status_changed_at'], delete_timestamp)
 
@@ -430,19 +424,47 @@ class TestAccountBroker(unittest.TestCase):
         self.assertEqual(listing[0][0], '0-0100')
         self.assertEqual(listing[-1][0], '0-0109')
 
+        listing = broker.list_containers_iter(10, '', None, '0-00', '-',
+                                              reverse=True)
+        self.assertEqual(len(listing), 10)
+        self.assertEqual(listing[0][0], '0-0099')
+        self.assertEqual(listing[-1][0], '0-0090')
+
         listing = broker.list_containers_iter(10, '', None, '0-', '-')
         self.assertEqual(len(listing), 10)
         self.assertEqual(listing[0][0], '0-0000')
         self.assertEqual(listing[-1][0], '0-0009')
+
+        listing = broker.list_containers_iter(10, '', None, '0-', '-',
+                                              reverse=True)
+        self.assertEqual(len(listing), 10)
+        self.assertEqual(listing[0][0], '0-0124')
+        self.assertEqual(listing[-1][0], '0-0115')
 
         listing = broker.list_containers_iter(10, '', None, '', '-')
         self.assertEqual(len(listing), 4)
         self.assertEqual([row[0] for row in listing],
                          ['0-', '1-', '2-', '3-'])
 
+        listing = broker.list_containers_iter(10, '', None, '', '-',
+                                              reverse=True)
+        self.assertEqual(len(listing), 4)
+        self.assertEqual([row[0] for row in listing],
+                         ['3-', '2-', '1-', '0-'])
+
         listing = broker.list_containers_iter(10, '2-', None, None, '-')
         self.assertEqual(len(listing), 1)
         self.assertEqual([row[0] for row in listing], ['3-'])
+
+        listing = broker.list_containers_iter(10, '2-', None, None, '-',
+                                              reverse=True)
+        self.assertEqual(len(listing), 2)
+        self.assertEqual([row[0] for row in listing], ['1-', '0-'])
+
+        listing = broker.list_containers_iter(10, '2.', None, None, '-',
+                                              reverse=True)
+        self.assertEqual(len(listing), 3)
+        self.assertEqual([row[0] for row in listing], ['2-', '1-', '0-'])
 
         listing = broker.list_containers_iter(10, '', None, '2', '-')
         self.assertEqual(len(listing), 1)
@@ -483,6 +505,168 @@ class TestAccountBroker(unittest.TestCase):
         self.assertEqual([row[0] for row in listing],
                          ['3-0049-', '3-0049-0049'])
 
+    def test_list_objects_iter_order_and_reverse(self):
+        # Test ContainerBroker.list_objects_iter
+        broker = AccountBroker(':memory:', account='a')
+        broker.initialize(Timestamp('1').internal, 0)
+
+        broker.put_container(
+            'c1', Timestamp(0).internal, 0, 0, 0, POLICIES.default.idx)
+        broker.put_container(
+            'c10', Timestamp(0).internal, 0, 0, 0, POLICIES.default.idx)
+        broker.put_container(
+            'C1', Timestamp(0).internal, 0, 0, 0, POLICIES.default.idx)
+        broker.put_container(
+            'c2', Timestamp(0).internal, 0, 0, 0, POLICIES.default.idx)
+        broker.put_container(
+            'c3', Timestamp(0).internal, 0, 0, 0, POLICIES.default.idx)
+        broker.put_container(
+            'C4', Timestamp(0).internal, 0, 0, 0, POLICIES.default.idx)
+
+        listing = broker.list_containers_iter(100, None, None, '', '',
+                                              reverse=False)
+        self.assertEqual([row[0] for row in listing],
+                         ['C1', 'C4', 'c1', 'c10', 'c2', 'c3'])
+        listing = broker.list_containers_iter(100, None, None, '', '',
+                                              reverse=True)
+        self.assertEqual([row[0] for row in listing],
+                         ['c3', 'c2', 'c10', 'c1', 'C4', 'C1'])
+        listing = broker.list_containers_iter(2, None, None, '', '',
+                                              reverse=True)
+        self.assertEqual([row[0] for row in listing],
+                         ['c3', 'c2'])
+        listing = broker.list_containers_iter(100, 'c2', 'C4', '', '',
+                                              reverse=True)
+        self.assertEqual([row[0] for row in listing],
+                         ['c10', 'c1'])
+
+    def test_reverse_prefix_delim(self):
+        expectations = [
+            {
+                'containers': [
+                    'topdir1-subdir1,0-c1',
+                    'topdir1-subdir1,1-c1',
+                    'topdir1-subdir1-c1',
+                ],
+                'params': {
+                    'prefix': 'topdir1-',
+                    'delimiter': '-',
+                },
+                'expected': [
+                    'topdir1-subdir1,0-',
+                    'topdir1-subdir1,1-',
+                    'topdir1-subdir1-',
+                ],
+            },
+            {
+                'containers': [
+                    'topdir1-subdir1,0-c1',
+                    'topdir1-subdir1,1-c1',
+                    'topdir1-subdir1-c1',
+                    'topdir1-subdir1.',
+                    'topdir1-subdir1.-c1',
+                ],
+                'params': {
+                    'prefix': 'topdir1-',
+                    'delimiter': '-',
+                },
+                'expected': [
+                    'topdir1-subdir1,0-',
+                    'topdir1-subdir1,1-',
+                    'topdir1-subdir1-',
+                    'topdir1-subdir1.',
+                    'topdir1-subdir1.-',
+                ],
+            },
+            {
+                'containers': [
+                    'topdir1-subdir1-c1',
+                    'topdir1-subdir1,0-c1',
+                    'topdir1-subdir1,1-c1',
+                ],
+                'params': {
+                    'prefix': 'topdir1-',
+                    'delimiter': '-',
+                    'reverse': True,
+                },
+                'expected': [
+                    'topdir1-subdir1-',
+                    'topdir1-subdir1,1-',
+                    'topdir1-subdir1,0-',
+                ],
+            },
+            {
+                'containers': [
+                    'topdir1-subdir1.-c1',
+                    'topdir1-subdir1.',
+                    'topdir1-subdir1-c1',
+                    'topdir1-subdir1-',
+                    'topdir1-subdir1,',
+                    'topdir1-subdir1,0-c1',
+                    'topdir1-subdir1,1-c1',
+                ],
+                'params': {
+                    'prefix': 'topdir1-',
+                    'delimiter': '-',
+                    'reverse': True,
+                },
+                'expected': [
+                    'topdir1-subdir1.-',
+                    'topdir1-subdir1.',
+                    'topdir1-subdir1-',
+                    'topdir1-subdir1,1-',
+                    'topdir1-subdir1,0-',
+                    'topdir1-subdir1,',
+                ],
+            },
+            {
+                'containers': [
+                    '1',
+                    '2',
+                    '3:1',
+                    '3:2:1',
+                    '3:2:2',
+                    '3:3',
+                    '4',
+                ],
+                'params': {
+                    'prefix': '3:',
+                    'delimiter': ':',
+                    'reverse': True,
+                },
+                'expected': [
+                    '3:3',
+                    '3:2:',
+                    '3:1',
+                ],
+            },
+        ]
+        ts = make_timestamp_iter()
+        default_listing_params = {
+            'limit': 10000,
+            'marker': '',
+            'end_marker': None,
+            'prefix': None,
+            'delimiter': None,
+        }
+        failures = []
+        for expected in expectations:
+            broker = AccountBroker(':memory:', account='a')
+            broker.initialize(next(ts).internal, 0)
+            for name in expected['containers']:
+                broker.put_container(name, next(ts).internal, 0, 0, 0,
+                                     POLICIES.default.idx)
+            params = default_listing_params.copy()
+            params.update(expected['params'])
+            listing = list(c[0] for c in broker.list_containers_iter(**params))
+            if listing != expected['expected']:
+                expected['listing'] = listing
+                failures.append(
+                    "With containers %(containers)r, the params %(params)r "
+                    "produced %(listing)r instead of %(expected)r" % expected)
+        self.assertFalse(failures, "Found the following failures:\n%s" %
+                         '\n'.join(failures))
+
     def test_double_check_trailing_delimiter(self):
         # Test AccountBroker.list_containers_iter for an
         # account that has an odd container with a trailing delimiter
@@ -500,6 +684,11 @@ class TestAccountBroker(unittest.TestCase):
                              POLICIES.default.idx)
         broker.put_container('a-b', Timestamp(time()).internal, 0, 0, 0,
                              POLICIES.default.idx)
+        # NB: ord(".") == ord("-") + 1
+        broker.put_container('a.', Timestamp(time()).internal, 0, 0, 0,
+                             POLICIES.default.idx)
+        broker.put_container('a.b', Timestamp(time()).internal, 0, 0, 0,
+                             POLICIES.default.idx)
         broker.put_container('b', Timestamp(time()).internal, 0, 0, 0,
                              POLICIES.default.idx)
         broker.put_container('b-a', Timestamp(time()).internal, 0, 0, 0,
@@ -509,20 +698,16 @@ class TestAccountBroker(unittest.TestCase):
         broker.put_container('c', Timestamp(time()).internal, 0, 0, 0,
                              POLICIES.default.idx)
         listing = broker.list_containers_iter(15, None, None, None, None)
-        self.assertEqual(len(listing), 10)
         self.assertEqual([row[0] for row in listing],
-                         ['a', 'a-', 'a-a', 'a-a-a', 'a-a-b', 'a-b', 'b',
-                          'b-a', 'b-b', 'c'])
+                         ['a', 'a-', 'a-a', 'a-a-a', 'a-a-b', 'a-b', 'a.',
+                          'a.b', 'b', 'b-a', 'b-b', 'c'])
         listing = broker.list_containers_iter(15, None, None, '', '-')
-        self.assertEqual(len(listing), 5)
         self.assertEqual([row[0] for row in listing],
-                         ['a', 'a-', 'b', 'b-', 'c'])
+                         ['a', 'a-', 'a.', 'a.b', 'b', 'b-', 'c'])
         listing = broker.list_containers_iter(15, None, None, 'a-', '-')
-        self.assertEqual(len(listing), 4)
         self.assertEqual([row[0] for row in listing],
                          ['a-', 'a-a', 'a-a-', 'a-b'])
         listing = broker.list_containers_iter(15, None, None, 'b-', '-')
-        self.assertEqual(len(listing), 2)
         self.assertEqual([row[0] for row in listing], ['b-a', 'b-b'])
 
     def test_chexor(self):
@@ -598,8 +783,8 @@ class TestAccountBroker(unittest.TestCase):
         broker2.merge_items(json.loads(json.dumps(broker1.get_items_since(
             broker2.get_sync(id1), 1000))), id1)
         items = broker2.get_items_since(-1, 1000)
-        self.assertEquals(['b', snowman],
-                          sorted([rec['name'] for rec in items]))
+        self.assertEqual(['b', snowman],
+                         sorted([rec['name'] for rec in items]))
         items_by_name = dict((rec['name'], rec) for rec in items)
 
         self.assertEqual(items_by_name[snowman]['object_count'], 2)
@@ -794,7 +979,7 @@ def premetadata_create_account_stat_table(self, conn, put_timestamp):
               put_timestamp))
 
 
-class TestCommonAccountBroker(TestExampleBroker):
+class TestCommonAccountBroker(test_db.TestExampleBroker):
 
     broker_class = AccountBroker
 
@@ -830,7 +1015,7 @@ class TestAccountBrokerBeforeMetadata(TestAccountBroker):
                 conn.execute('SELECT metadata FROM account_stat')
             except BaseException as err:
                 exc = err
-        self.assert_('no such column: metadata' in str(exc))
+        self.assertTrue('no such column: metadata' in str(exc))
 
     def tearDown(self):
         AccountBroker.create_account_stat_table = \
@@ -917,12 +1102,12 @@ class TestAccountBrokerBeforeSPI(TestAccountBroker):
                 conn.execute('SELECT storage_policy_index FROM container')
             except BaseException as err:
                 exc = err
-        self.assert_('no such column: storage_policy_index' in str(exc))
+        self.assertTrue('no such column: storage_policy_index' in str(exc))
         with broker.get() as conn:
             try:
                 conn.execute('SELECT * FROM policy_stat')
             except sqlite3.OperationalError as err:
-                self.assert_('no such table: policy_stat' in str(err))
+                self.assertTrue('no such table: policy_stat' in str(err))
             else:
                 self.fail('database created with policy_stat table')
 
@@ -949,7 +1134,7 @@ class TestAccountBrokerBeforeSPI(TestAccountBroker):
                     ''').fetchone()[0]
             except sqlite3.OperationalError as err:
                 # confirm that the table really isn't there
-                self.assert_('no such table: policy_stat' in str(err))
+                self.assertTrue('no such table: policy_stat' in str(err))
             else:
                 self.fail('broker did not raise sqlite3.OperationalError '
                           'trying to select from policy_stat table!')
@@ -985,8 +1170,8 @@ class TestAccountBrokerBeforeSPI(TestAccountBroker):
                     ''').fetchone()[0]
             except sqlite3.OperationalError as err:
                 # confirm that the table doesn't have this column
-                self.assert_('no such column: storage_policy_index' in
-                             str(err))
+                self.assertTrue('no such column: storage_policy_index' in
+                                str(err))
             else:
                 self.fail('broker did not raise sqlite3.OperationalError '
                           'trying to select from storage_policy_index '
@@ -1097,7 +1282,7 @@ class TestAccountBrokerBeforeSPI(TestAccountBroker):
             self.fail('mock exception was not raised')
 
         self.assertEqual(len(called), 1)
-        self.assert_('CREATE TABLE policy_stat' in called[0])
+        self.assertTrue('CREATE TABLE policy_stat' in called[0])
 
         # nothing was committed
         broker = AccountBroker(db_path, account='a')
@@ -1105,7 +1290,7 @@ class TestAccountBrokerBeforeSPI(TestAccountBroker):
             try:
                 conn.execute('SELECT * FROM policy_stat')
             except sqlite3.OperationalError as err:
-                self.assert_('no such table: policy_stat' in str(err))
+                self.assertTrue('no such table: policy_stat' in str(err))
             else:
                 self.fail('half upgraded database!')
             container_count = conn.execute(
@@ -1269,7 +1454,7 @@ class AccountBrokerPreTrackContainerCountSetup(object):
                     ''').fetchone()[0]
             except sqlite3.OperationalError as err:
                 # confirm that the column really isn't there
-                self.assert_('no such column: container_count' in str(err))
+                self.assertTrue('no such column: container_count' in str(err))
             else:
                 self.fail('broker did not raise sqlite3.OperationalError '
                           'trying to select container_count from policy_stat!')
@@ -1500,3 +1685,15 @@ class TestAccountBrokerBeforePerPolicyContainerTrack(
         self.assertEqual(len(policy_info), 2)
         for policy_stat in policy_info.values():
             self.assertEqual(policy_stat['container_count'], 1)
+
+    def test_migrate_add_storage_policy_index_fail(self):
+        broker = AccountBroker(':memory:', account='a')
+        broker.initialize(Timestamp('1').internal)
+        with mock.patch.object(
+                broker, 'create_policy_stat_table',
+                side_effect=sqlite3.OperationalError('foobar')):
+            with broker.get() as conn:
+                self.assertRaisesRegexp(
+                    sqlite3.OperationalError, '.*foobar.*',
+                    broker._migrate_add_storage_policy_index,
+                    conn=conn)

@@ -15,17 +15,18 @@
 import os
 import unittest
 import mock
-from cStringIO import StringIO
 from shutil import rmtree
 from tempfile import mkdtemp
 
+from six.moves import cStringIO as StringIO
 from test.unit import patch_policies, write_fake_ring
 
 from swift.common import ring, utils
 from swift.common.swob import Request
 from swift.common.storage_policy import StoragePolicy, POLICIES
 from swift.cli.info import print_db_info_metadata, print_ring_locations, \
-    print_info, print_obj_metadata, print_obj, InfoSystemExit
+    print_info, print_obj_metadata, print_obj, InfoSystemExit, \
+    print_item_locations
 from swift.account.server import AccountController
 from swift.container.server import ContainerController
 from swift.obj.diskfile import write_metadata
@@ -128,8 +129,8 @@ Metadata:
 No system metadata found in db file
   User Metadata: {'mydata': 'swift'}'''
 
-        self.assertEquals(sorted(out.getvalue().strip().split('\n')),
-                          sorted(exp_out.split('\n')))
+        self.assertEqual(sorted(out.getvalue().strip().split('\n')),
+                         sorted(exp_out.split('\n')))
 
         info = dict(
             account='acct',
@@ -175,8 +176,8 @@ Metadata:
   X-Container-Foo: bar
   System Metadata: {'mydata': 'swift'}
 No user metadata found in db file''' % POLICIES[0].name
-        self.assertEquals(sorted(out.getvalue().strip().split('\n')),
-                          sorted(exp_out.split('\n')))
+        self.assertEqual(sorted(out.getvalue().strip().split('\n')),
+                         sorted(exp_out.split('\n')))
 
     def test_print_ring_locations_invalid_args(self):
         self.assertRaises(ValueError, print_ring_locations,
@@ -230,6 +231,171 @@ No user metadata found in db file''' % POLICIES[0].name
                                 'objects', '1')
         self.assertTrue(exp_obj1 in out.getvalue())
         self.assertTrue(exp_obj2 in out.getvalue())
+
+    def test_print_item_locations_invalid_args(self):
+        # No target specified
+        self.assertRaises(InfoSystemExit, print_item_locations,
+                          None)
+        # Need a ring or policy
+        self.assertRaises(InfoSystemExit, print_item_locations,
+                          None, account='account', obj='object')
+        # No account specified
+        self.assertRaises(InfoSystemExit, print_item_locations,
+                          None, container='con')
+        # No policy named 'xyz' (unrecognized policy)
+        self.assertRaises(InfoSystemExit, print_item_locations,
+                          None, obj='object', policy_name='xyz')
+        # No container specified
+        objring = ring.Ring(self.testdir, ring_name='object')
+        self.assertRaises(InfoSystemExit, print_item_locations,
+                          objring, account='account', obj='object')
+
+    def test_print_item_locations_ring_policy_mismatch_no_target(self):
+        out = StringIO()
+        with mock.patch('sys.stdout', out):
+            objring = ring.Ring(self.testdir, ring_name='object')
+            # Test mismatch of ring and policy name (valid policy)
+            self.assertRaises(InfoSystemExit, print_item_locations,
+                              objring, policy_name='zero')
+        self.assertTrue('Warning: mismatch between ring and policy name!'
+                        in out.getvalue())
+        self.assertTrue('No target specified' in out.getvalue())
+
+    def test_print_item_locations_invalid_policy_no_target(self):
+        out = StringIO()
+        policy_name = 'nineteen'
+        with mock.patch('sys.stdout', out):
+            objring = ring.Ring(self.testdir, ring_name='object')
+            self.assertRaises(InfoSystemExit, print_item_locations,
+                              objring, policy_name=policy_name)
+        exp_msg = 'Warning: Policy %s is not valid' % policy_name
+        self.assertTrue(exp_msg in out.getvalue())
+        self.assertTrue('No target specified' in out.getvalue())
+
+    def test_print_item_locations_policy_object(self):
+        out = StringIO()
+        part = '1'
+        with mock.patch('sys.stdout', out):
+            print_item_locations(None, partition=part, policy_name='zero',
+                                 swift_dir=self.testdir)
+        exp_part_msg = 'Partition\t%s' % part
+        exp_acct_msg = 'Account  \tNone'
+        exp_cont_msg = 'Container\tNone'
+        exp_obj_msg = 'Object   \tNone'
+        self.assertTrue(exp_part_msg in out.getvalue())
+        self.assertTrue(exp_acct_msg in out.getvalue())
+        self.assertTrue(exp_cont_msg in out.getvalue())
+        self.assertTrue(exp_obj_msg in out.getvalue())
+
+    def test_print_item_locations_dashed_ring_name_partition(self):
+        out = StringIO()
+        part = '1'
+        with mock.patch('sys.stdout', out):
+            print_item_locations(None, policy_name='one',
+                                 ring_name='foo-bar', partition=part,
+                                 swift_dir=self.testdir)
+        exp_part_msg = 'Partition\t%s' % part
+        exp_acct_msg = 'Account  \tNone'
+        exp_cont_msg = 'Container\tNone'
+        exp_obj_msg = 'Object   \tNone'
+        self.assertTrue(exp_part_msg in out.getvalue())
+        self.assertTrue(exp_acct_msg in out.getvalue())
+        self.assertTrue(exp_cont_msg in out.getvalue())
+        self.assertTrue(exp_obj_msg in out.getvalue())
+
+    def test_print_item_locations_account_with_ring(self):
+        out = StringIO()
+        account = 'account'
+        with mock.patch('sys.stdout', out):
+            account_ring = ring.Ring(self.testdir, ring_name=account)
+            print_item_locations(account_ring, account=account)
+        exp_msg = 'Account  \t%s' % account
+        self.assertTrue(exp_msg in out.getvalue())
+        exp_warning = 'Warning: account specified ' + \
+                      'but ring not named "account"'
+        self.assertTrue(exp_warning in out.getvalue())
+        exp_acct_msg = 'Account  \t%s' % account
+        exp_cont_msg = 'Container\tNone'
+        exp_obj_msg = 'Object   \tNone'
+        self.assertTrue(exp_acct_msg in out.getvalue())
+        self.assertTrue(exp_cont_msg in out.getvalue())
+        self.assertTrue(exp_obj_msg in out.getvalue())
+
+    def test_print_item_locations_account_no_ring(self):
+        out = StringIO()
+        account = 'account'
+        with mock.patch('sys.stdout', out):
+            print_item_locations(None, account=account,
+                                 swift_dir=self.testdir)
+        exp_acct_msg = 'Account  \t%s' % account
+        exp_cont_msg = 'Container\tNone'
+        exp_obj_msg = 'Object   \tNone'
+        self.assertTrue(exp_acct_msg in out.getvalue())
+        self.assertTrue(exp_cont_msg in out.getvalue())
+        self.assertTrue(exp_obj_msg in out.getvalue())
+
+    def test_print_item_locations_account_container_ring(self):
+        out = StringIO()
+        account = 'account'
+        container = 'container'
+        with mock.patch('sys.stdout', out):
+            container_ring = ring.Ring(self.testdir, ring_name='container')
+            print_item_locations(container_ring, account=account,
+                                 container=container)
+        exp_acct_msg = 'Account  \t%s' % account
+        exp_cont_msg = 'Container\t%s' % container
+        exp_obj_msg = 'Object   \tNone'
+        self.assertTrue(exp_acct_msg in out.getvalue())
+        self.assertTrue(exp_cont_msg in out.getvalue())
+        self.assertTrue(exp_obj_msg in out.getvalue())
+
+    def test_print_item_locations_account_container_no_ring(self):
+        out = StringIO()
+        account = 'account'
+        container = 'container'
+        with mock.patch('sys.stdout', out):
+            print_item_locations(None, account=account,
+                                 container=container, swift_dir=self.testdir)
+        exp_acct_msg = 'Account  \t%s' % account
+        exp_cont_msg = 'Container\t%s' % container
+        exp_obj_msg = 'Object   \tNone'
+        self.assertTrue(exp_acct_msg in out.getvalue())
+        self.assertTrue(exp_cont_msg in out.getvalue())
+        self.assertTrue(exp_obj_msg in out.getvalue())
+
+    def test_print_item_locations_account_container_object_ring(self):
+        out = StringIO()
+        account = 'account'
+        container = 'container'
+        obj = 'object'
+        with mock.patch('sys.stdout', out):
+            object_ring = ring.Ring(self.testdir, ring_name='object')
+            print_item_locations(object_ring, ring_name='object',
+                                 account=account, container=container,
+                                 obj=obj)
+        exp_acct_msg = 'Account  \t%s' % account
+        exp_cont_msg = 'Container\t%s' % container
+        exp_obj_msg = 'Object   \t%s' % obj
+        self.assertTrue(exp_acct_msg in out.getvalue())
+        self.assertTrue(exp_cont_msg in out.getvalue())
+        self.assertTrue(exp_obj_msg in out.getvalue())
+
+    def test_print_item_locations_account_container_object_dashed_ring(self):
+        out = StringIO()
+        account = 'account'
+        container = 'container'
+        obj = 'object'
+        with mock.patch('sys.stdout', out):
+            object_ring = ring.Ring(self.testdir, ring_name='object-1')
+            print_item_locations(object_ring, ring_name='object-1',
+                                 account=account, container=container,
+                                 obj=obj)
+        exp_acct_msg = 'Account  \t%s' % account
+        exp_cont_msg = 'Container\t%s' % container
+        exp_obj_msg = 'Object   \t%s' % obj
+        self.assertTrue(exp_acct_msg in out.getvalue())
+        self.assertTrue(exp_cont_msg in out.getvalue())
+        self.assertTrue(exp_obj_msg in out.getvalue())
 
     def test_print_info(self):
         db_file = 'foo'
@@ -306,7 +472,7 @@ No user metadata found in db file''' % POLICIES[0].name
         if exp_raised:
             exp_out = 'Does not appear to be a DB of type "account":' \
                 ' ./d49d0ecbb53be1fcc49624f2f7c7ccae.db'
-            self.assertEquals(out.getvalue().strip(), exp_out)
+            self.assertEqual(out.getvalue().strip(), exp_out)
         else:
             self.fail("Expected an InfoSystemExit exception to be raised")
 
@@ -334,8 +500,8 @@ class TestPrintObj(TestCliInfoBase):
         out = StringIO()
         with mock.patch('sys.stdout', out):
             self.assertRaises(InfoSystemExit, print_obj, datafile)
-            self.assertEquals(out.getvalue().strip(),
-                              'Invalid metadata')
+            self.assertEqual(out.getvalue().strip(),
+                             'Invalid metadata')
 
     def test_print_obj_valid(self):
         out = StringIO()
@@ -385,6 +551,23 @@ class TestPrintObjFullMeta(TestCliInfoBase):
         with mock.patch('sys.stdout', out):
             print_obj(self.datafile, swift_dir=self.testdir)
         self.assertTrue('/objects-1/' in out.getvalue())
+
+    def test_print_obj_policy_index(self):
+        # Check an output of policy index when current directory is in
+        # object-* directory
+        out = StringIO()
+        hash_dir = os.path.dirname(self.datafile)
+        file_name = os.path.basename(self.datafile)
+
+        # Change working directory to object hash dir
+        cwd = os.getcwd()
+        try:
+            os.chdir(hash_dir)
+            with mock.patch('sys.stdout', out):
+                print_obj(file_name, swift_dir=self.testdir)
+        finally:
+            os.chdir(cwd)
+        self.assertTrue('X-Backend-Storage-Policy-Index: 1' in out.getvalue())
 
     def test_print_obj_meta_and_ts_files(self):
         # verify that print_obj will also read from meta and ts files
@@ -472,7 +655,7 @@ Other Metadata:
   No metadata found''' % (
             utils.Timestamp(106.3).internal)
 
-        self.assertEquals(out.getvalue().strip(), exp_out)
+        self.assertEqual(out.getvalue().strip(), exp_out)
 
         metadata = get_metadata({
             'X-Object-Sysmeta-Mtime': '107.3',
@@ -497,7 +680,7 @@ Other Metadata:
   No metadata found''' % (
             utils.Timestamp(106.3).internal)
 
-        self.assertEquals(out.getvalue().strip(), exp_out)
+        self.assertEqual(out.getvalue().strip(), exp_out)
 
         metadata = get_metadata({
             'X-Object-Meta-Mtime': '107.3',
@@ -522,7 +705,7 @@ Other Metadata:
   X-Object-Mtime: 107.3''' % (
             utils.Timestamp(106.3).internal)
 
-        self.assertEquals(out.getvalue().strip(), exp_out)
+        self.assertEqual(out.getvalue().strip(), exp_out)
 
         metadata = get_metadata({})
         out = StringIO()
@@ -543,7 +726,7 @@ Other Metadata:
   No metadata found''' % (
             utils.Timestamp(106.3).internal)
 
-        self.assertEquals(out.getvalue().strip(), exp_out)
+        self.assertEqual(out.getvalue().strip(), exp_out)
 
         metadata = get_metadata({'X-Object-Meta-Mtime': '107.3'})
         metadata['name'] = '/a-s'
@@ -566,7 +749,7 @@ Other Metadata:
   No metadata found''' % (
             utils.Timestamp(106.3).internal)
 
-        self.assertEquals(out.getvalue().strip(), exp_out)
+        self.assertEqual(out.getvalue().strip(), exp_out)
 
         metadata = get_metadata({'X-Object-Meta-Mtime': '107.3'})
         del metadata['Content-Type']
@@ -588,7 +771,7 @@ Other Metadata:
   No metadata found''' % (
             utils.Timestamp(106.3).internal)
 
-        self.assertEquals(out.getvalue().strip(), exp_out)
+        self.assertEqual(out.getvalue().strip(), exp_out)
 
         metadata = get_metadata({'X-Object-Meta-Mtime': '107.3'})
         del metadata['X-Timestamp']
@@ -609,4 +792,22 @@ User Metadata:
 Other Metadata:
   No metadata found'''
 
-        self.assertEquals(out.getvalue().strip(), exp_out)
+        self.assertEqual(out.getvalue().strip(), exp_out)
+
+
+class TestPrintObjWeirdPath(TestPrintObjFullMeta):
+    def setUp(self):
+        super(TestPrintObjWeirdPath, self).setUp()
+        # device name is objects-0 instead of sda, this is weird.
+        self.datafile = os.path.join(self.testdir,
+                                     'objects-0', 'objects-1',
+                                     '1', 'ea8',
+                                     'db4449e025aca992307c7c804a67eea8',
+                                     '1402017884.18202.data')
+        utils.mkdirs(os.path.dirname(self.datafile))
+        with open(self.datafile, 'wb') as fp:
+            md = {'name': '/AUTH_admin/c/obj',
+                  'Content-Type': 'application/octet-stream',
+                  'ETag': 'd41d8cd98f00b204e9800998ecf8427e',
+                  'Content-Length': 0}
+            write_metadata(fp, md)

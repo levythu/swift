@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import cPickle as pickle
+import six.moves.cPickle as pickle
 import os
 import signal
 import sys
@@ -48,7 +48,7 @@ class ObjectUpdater(Daemon):
         self.container_ring = None
         self.concurrency = int(conf.get('concurrency', 1))
         self.slowdown = float(conf.get('slowdown', 0.01))
-        self.node_timeout = int(conf.get('node_timeout', 10))
+        self.node_timeout = float(conf.get('node_timeout', 10))
         self.conn_timeout = float(conf.get('conn_timeout', 0.5))
         self.successes = 0
         self.failures = 0
@@ -84,7 +84,7 @@ class ObjectUpdater(Daemon):
                 if self.mount_check and \
                         not ismount(os.path.join(self.devices, device)):
                     self.logger.increment('errors')
-                    self.logger.warn(
+                    self.logger.warning(
                         _('Skipping %s as it is not mounted'), device)
                     continue
                 while len(pids) >= self.concurrency:
@@ -127,7 +127,7 @@ class ObjectUpdater(Daemon):
             if self.mount_check and \
                     not ismount(os.path.join(self.devices, device)):
                 self.logger.increment('errors')
-                self.logger.warn(
+                self.logger.warning(
                     _('Skipping %s as it is not mounted'), device)
                 continue
             self.object_sweep(os.path.join(self.devices, device))
@@ -159,8 +159,9 @@ class ObjectUpdater(Daemon):
             try:
                 base, policy = split_policy_string(asyncdir)
             except PolicyError as e:
-                self.logger.warn(_('Directory %r does not map '
-                                   'to a valid policy (%s)') % (asyncdir, e))
+                self.logger.warning(_('Directory %r does not map '
+                                    'to a valid policy (%s)') %
+                                    (asyncdir, e))
                 continue
             for prefix in self._listdir(async_pending):
                 prefix_path = os.path.join(async_pending, prefix)
@@ -256,7 +257,7 @@ class ObjectUpdater(Daemon):
 
         :param node: node dictionary from the container ring
         :param part: partition that holds the container
-        :param op: operation performed (ex: 'POST' or 'DELETE')
+        :param op: operation performed (ex: 'PUT' or 'DELETE')
         :param obj: object name being updated
         :param headers_out: headers to send with the update
         """

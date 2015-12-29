@@ -13,20 +13,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from httplib import HTTPConnection
+from __future__ import print_function
 import os
 from subprocess import Popen, PIPE
 import sys
 from time import sleep, time
 from collections import defaultdict
 import unittest
+from hashlib import md5
+from uuid import uuid4
 from nose import SkipTest
 
-from swiftclient import get_auth, head_account
+from six.moves.http_client import HTTPConnection
 
+from swiftclient import get_auth, head_account
 from swift.obj.diskfile import get_data_dir
 from swift.common.ring import Ring
-from swift.common.utils import readconf, renamer
+from swift.common.utils import readconf, renamer, \
+    config_true_value, rsync_module_interpolation
 from swift.common.manager import Manager
 from swift.common.storage_policy import POLICIES, EC_POLICY, REPL_POLICY
 
@@ -85,9 +89,9 @@ def check_server(ipport, ipport2server, pids, timeout=CHECK_SERVER_TIMEOUT):
                 break
             except Exception as err:
                 if time() > try_until:
-                    print err
-                    print 'Giving up on %s:%s after %s seconds.' % (
-                        server, ipport, timeout)
+                    print(err)
+                    print('Giving up on %s:%s after %s seconds.' % (
+                        server, ipport, timeout))
                     raise err
                 sleep(0.1)
     else:
@@ -101,8 +105,8 @@ def check_server(ipport, ipport2server, pids, timeout=CHECK_SERVER_TIMEOUT):
                 return url, token, account
             except Exception as err:
                 if time() > try_until:
-                    print err
-                    print 'Giving up on proxy:8080 after 30 seconds.'
+                    print(err)
+                    print('Giving up on proxy:8080 after 30 seconds.')
                     raise err
                 sleep(0.1)
     return None
@@ -194,10 +198,12 @@ def get_ring(ring_name, required_replicas, required_devices,
     if ring.replica_count != required_replicas:
         raise SkipTest('%s has %s replicas instead of %s' % (
             ring.serialized_path, ring.replica_count, required_replicas))
-    if len(ring.devs) != required_devices:
+
+    devs = [dev for dev in ring.devs if dev is not None]
+    if len(devs) != required_devices:
         raise SkipTest('%s has %s devices instead of %s' % (
             ring.serialized_path, len(ring.devs), required_devices))
-    for dev in ring.devs:
+    for dev in devs:
         # verify server is exposing mounted device
         ipport = (dev['ip'], dev['port'])
         _, server_number = get_server_number(ipport, ipport2server)
@@ -216,11 +222,12 @@ def get_ring(ring_name, required_replicas, required_devices,
                 "unable to find ring device %s under %s's devices (%s)" % (
                     dev['device'], server, conf['devices']))
         # verify server is exposing rsync device
-        if conf.get('vm_test_mode', False):
-            rsync_export = '%s%s' % (server, dev['replication_port'])
-        else:
-            rsync_export = server
-        cmd = "rsync rsync://localhost/%s" % rsync_export
+        rsync_export = conf.get('rsync_module', '').rstrip('/')
+        if not rsync_export:
+            rsync_export = '{replication_ip}::%s' % server
+            if config_true_value(conf.get('vm_test_mode', 'no')):
+                rsync_export += '{replication_port}'
+        cmd = "rsync %s" % rsync_module_interpolation(rsync_export, dev)
         p = Popen(cmd, shell=True, stdout=PIPE)
         stdout, _stderr = p.communicate()
         if p.returncode:
@@ -254,16 +261,63 @@ def get_policy(**kwargs):
     raise SkipTest('No policy matching %s' % kwargs)
 
 
+def resetswift():
+    p = Popen("resetswift 2>&1", shell=True, stdout=PIPE)
+    stdout, _stderr = p.communicate()
+    print(stdout)
+    Manager(['all']).stop()
+
+
+class Body(object):
+
+    def __init__(self, total=3.5 * 2 ** 20):
+        self.length = total
+        self.hasher = md5()
+        self.read_amount = 0
+        self.chunk = uuid4().hex * 2 ** 10
+        self.buff = ''
+
+    @property
+    def etag(self):
+        return self.hasher.hexdigest()
+
+    def __len__(self):
+        return self.length
+
+    def read(self, amount):
+        if len(self.buff) < amount:
+            try:
+                self.buff += next(self)
+            except StopIteration:
+                pass
+        rv, self.buff = self.buff[:amount], self.buff[amount:]
+        return rv
+
+    def __iter__(self):
+        return self
+
+    def next(self):
+        if self.buff:
+            rv, self.buff = self.buff, ''
+            return rv
+        if self.read_amount >= self.length:
+            raise StopIteration()
+        rv = self.chunk[:int(self.length - self.read_amount)]
+        self.read_amount += len(rv)
+        self.hasher.update(rv)
+        return rv
+
+    def __next__(self):
+        return next(self)
+
+
 class ProbeTest(unittest.TestCase):
     """
     Don't instantiate this directly, use a child class instead.
     """
 
     def setUp(self):
-        p = Popen("resetswift 2>&1", shell=True, stdout=PIPE)
-        stdout, _stderr = p.communicate()
-        print stdout
-        Manager(['all']).stop()
+        resetswift()
         self.pids = {}
         try:
             self.ipport2server = {}
@@ -402,11 +456,11 @@ if __name__ == "__main__":
                      force_validate=True)
         except SkipTest as err:
             sys.exit('%s ERROR: %s' % (server, err))
-        print '%s OK' % server
+        print('%s OK' % server)
     for policy in POLICIES:
         try:
             get_ring(policy.ring_name, 3, 4,
                      server='object', force_validate=True)
         except SkipTest as err:
             sys.exit('object ERROR (%s): %s' % (policy.name, err))
-        print 'object OK (%s)' % policy.name
+        print('object OK (%s)' % policy.name)

@@ -21,35 +21,25 @@ import errno
 import fcntl
 import grp
 import hmac
+import json
 import operator
 import os
 import pwd
 import re
-import rfc822
 import sys
-import threading as stdlib_threading
 import time
 import uuid
 import functools
-import weakref
+import email.parser
 from hashlib import md5, sha1
 from random import random, shuffle
-from urllib import quote as _quote
 from contextlib import contextmanager, closing
 import ctypes
 import ctypes.util
-from ConfigParser import ConfigParser, NoSectionError, NoOptionError, \
-    RawConfigParser
 from optparse import OptionParser
-from Queue import Queue, Empty
+
 from tempfile import mkstemp, NamedTemporaryFile
-try:
-    import simplejson as json
-except ImportError:
-    import json
-import cPickle as pickle
 import glob
-from urlparse import urlparse as stdlib_urlparse, ParseResult
 import itertools
 import stat
 import datetime
@@ -64,13 +54,25 @@ import netifaces
 import codecs
 utf8_decoder = codecs.getdecoder('utf-8')
 utf8_encoder = codecs.getencoder('utf-8')
+import six
+from six.moves import cPickle as pickle
+from six.moves.configparser import (ConfigParser, NoSectionError,
+                                    NoOptionError, RawConfigParser)
 from six.moves import range
+from six.moves.urllib.parse import ParseResult
+from six.moves.urllib.parse import quote as _quote
+from six.moves.urllib.parse import urlparse as stdlib_urlparse
 
 from swift import gettext_ as _
 import swift.common.exceptions
 from swift.common.http import is_success, is_redirection, HTTP_NOT_FOUND, \
     HTTP_PRECONDITION_FAILED, HTTP_REQUESTED_RANGE_NOT_SATISFIABLE
 
+if six.PY3:
+    stdlib_queue = eventlet.patcher.original('queue')
+else:
+    stdlib_queue = eventlet.patcher.original('Queue')
+stdlib_threading = eventlet.patcher.original('threading')
 
 # logging doesn't import patched as cleanly as one would like
 from logging.handlers import SysLogHandler
@@ -80,7 +82,7 @@ logging.threading = eventlet.green.threading
 logging._lock = logging.threading.RLock()
 # setup notice level logging
 NOTICE = 25
-logging._levelNames[NOTICE] = 'NOTICE'
+logging.addLevelName(NOTICE, 'NOTICE')
 SysLogHandler.priority_map['NOTICE'] = 'notice'
 
 # These are lazily pulled from libc elsewhere
@@ -246,7 +248,7 @@ def backward(f, blocksize=4096):
     f.seek(0, os.SEEK_END)
     if f.tell() == 0:
         return
-    last_row = ''
+    last_row = b''
     while f.tell() != 0:
         try:
             f.seek(-blocksize, os.SEEK_CUR)
@@ -255,7 +257,7 @@ def backward(f, blocksize=4096):
             f.seek(-blocksize, os.SEEK_CUR)
         block = f.read(blocksize)
         f.seek(-blocksize, os.SEEK_CUR)
-        rows = block.split('\n')
+        rows = block.split(b'\n')
         rows[-1] = rows[-1] + last_row
         while rows:
             last_row = rows.pop(-1)
@@ -274,7 +276,7 @@ def config_true_value(value):
     Returns False otherwise.
     """
     return value is True or \
-        (isinstance(value, basestring) and value.lower() in TRUE_VALUES)
+        (isinstance(value, six.string_types) and value.lower() in TRUE_VALUES)
 
 
 def config_auto_int_value(value, default):
@@ -283,7 +285,7 @@ def config_auto_int_value(value, default):
     Returns value as an int or raises ValueError otherwise.
     """
     if value is None or \
-       (isinstance(value, basestring) and value.lower() == 'auto'):
+       (isinstance(value, six.string_types) and value.lower() == 'auto'):
         return default
     try:
         value = int(value)
@@ -294,7 +296,7 @@ def config_auto_int_value(value, default):
 
 
 def append_underscore(prefix):
-    if prefix and prefix[-1] != '_':
+    if prefix and not prefix.endswith('_'):
         prefix += '_'
     return prefix
 
@@ -387,8 +389,8 @@ def load_libc_function(func_name, log_error=True,
         if fail_if_missing:
             raise
         if log_error:
-            logging.warn(_("Unable to locate %s in libc.  Leaving as a "
-                         "no-op."), func_name)
+            logging.warning(_("Unable to locate %s in libc.  Leaving as a "
+                            "no-op."), func_name)
         return noop_libc_function
 
 
@@ -437,7 +439,8 @@ def get_log_line(req, res, trans_time, additional_info):
 
 
 def get_trans_id_time(trans_id):
-    if len(trans_id) >= 34 and trans_id[:2] == 'tx' and trans_id[23] == '-':
+    if len(trans_id) >= 34 and \
+       trans_id.startswith('tx') and trans_id[23] == '-':
         try:
             return int(trans_id[24:34], 16)
         except ValueError:
@@ -568,17 +571,17 @@ class FallocateWrapper(object):
             self.func_name = 'posix_fallocate'
             self.fallocate = noop_libc_function
             return
-        ## fallocate is preferred because we need the on-disk size to match
-        ## the allocated size. Older versions of sqlite require that the
-        ## two sizes match. However, fallocate is Linux only.
+        # fallocate is preferred because we need the on-disk size to match
+        # the allocated size. Older versions of sqlite require that the
+        # two sizes match. However, fallocate is Linux only.
         for func in ('fallocate', 'posix_fallocate'):
             self.func_name = func
             self.fallocate = load_libc_function(func, log_error=False)
             if self.fallocate is not noop_libc_function:
                 break
         if self.fallocate is noop_libc_function:
-            logging.warn(_("Unable to locate fallocate, posix_fallocate in "
-                         "libc.  Leaving as a no-op."))
+            logging.warning(_("Unable to locate fallocate, posix_fallocate in "
+                            "libc.  Leaving as a no-op."))
 
     def __call__(self, fd, mode, offset, length):
         """The length parameter must be a ctypes.c_uint64."""
@@ -661,8 +664,8 @@ def fsync_dir(dirpath):
         if err.errno == errno.ENOTDIR:
             # Raise error if someone calls fsync_dir on a non-directory
             raise
-        logging.warn(_("Unable to perform fsync() on directory %s: %s"),
-                     dirpath, os.strerror(err.errno))
+        logging.warning(_("Unable to perform fsync() on directory %s: %s"),
+                        dirpath, os.strerror(err.errno))
     finally:
         if dirfd:
             os.close(dirfd)
@@ -683,14 +686,15 @@ def drop_buffer_cache(fd, offset, length):
     ret = _posix_fadvise(fd, ctypes.c_uint64(offset),
                          ctypes.c_uint64(length), 4)
     if ret != 0:
-        logging.warn("posix_fadvise64(%(fd)s, %(offset)s, %(length)s, 4) "
-                     "-> %(ret)s", {'fd': fd, 'offset': offset,
-                                    'length': length, 'ret': ret})
+        logging.warning("posix_fadvise64(%(fd)s, %(offset)s, %(length)s, 4) "
+                        "-> %(ret)s", {'fd': fd, 'offset': offset,
+                                       'length': length, 'ret': ret})
 
 
 NORMAL_FORMAT = "%016.05f"
 INTERNAL_FORMAT = NORMAL_FORMAT + '_%016x'
 MAX_OFFSET = (16 ** 16) - 1
+PRECISION = 1e-5
 # Setting this to True will cause the internal format to always display
 # extended digits - even when the value is equivalent to the normalized form.
 # This isn't ideal during an upgrade when some servers might not understand
@@ -735,8 +739,21 @@ class Timestamp(object):
     compatible for normalized timestamps which do not include an offset.
     """
 
-    def __init__(self, timestamp, offset=0):
-        if isinstance(timestamp, basestring):
+    def __init__(self, timestamp, offset=0, delta=0):
+        """
+        Create a new Timestamp.
+
+        :param timestamp: time in seconds since the Epoch, may be any of:
+
+            * a float or integer
+            * normalized/internalized string
+            * another instance of this class (offset is preserved)
+
+        :param offset: the second internal offset vector, an int
+        :param delta: deca-microsecond difference from the base timestamp
+                      param, an int
+        """
+        if isinstance(timestamp, six.string_types):
             parts = timestamp.split('_', 1)
             self.timestamp = float(parts.pop(0))
             if parts:
@@ -753,6 +770,14 @@ class Timestamp(object):
             raise ValueError('offset must be non-negative')
         if self.offset > MAX_OFFSET:
             raise ValueError('offset must be smaller than %d' % MAX_OFFSET)
+        self.raw = int(round(self.timestamp / PRECISION))
+        # add delta
+        if delta:
+            self.raw = self.raw + delta
+            if self.raw <= 0:
+                raise ValueError(
+                    'delta must be greater than %d' % (-1 * self.raw))
+            self.timestamp = float(self.raw * PRECISION)
 
     def __repr__(self):
         return INTERNAL_FORMAT % (self.timestamp, self.offset)
@@ -768,6 +793,9 @@ class Timestamp(object):
 
     def __nonzero__(self):
         return bool(self.timestamp or self.offset)
+
+    def __bool__(self):
+        return self.__nonzero__()
 
     @property
     def normal(self):
@@ -803,6 +831,9 @@ class Timestamp(object):
         if not isinstance(other, Timestamp):
             other = Timestamp(other)
         return cmp(self.internal, other.internal)
+
+    def __hash__(self):
+        return hash(self.internal)
 
 
 def normalize_timestamp(timestamp):
@@ -1145,7 +1176,7 @@ class StatsdClient(object):
                 return sock.sendto('|'.join(parts), self._target)
             except IOError as err:
                 if self.logger:
-                    self.logger.warn(
+                    self.logger.warning(
                         'Error sending UDP message to %r: %s',
                         self._target, err)
 
@@ -1217,27 +1248,6 @@ def timing_stats(**dec_kwargs):
     return decorating_func
 
 
-class LoggingHandlerWeakRef(weakref.ref):
-    """
-    Like a weak reference, but passes through a couple methods that logging
-    handlers need.
-    """
-
-    def close(self):
-        referent = self()
-        try:
-            if referent:
-                referent.close()
-        except KeyError:
-            # This is to catch an issue with old py2.6 versions
-            pass
-
-    def flush(self):
-        referent = self()
-        if referent:
-            referent.flush()
-
-
 # double inheritance to support property with setter
 class LogAdapter(logging.LoggerAdapter, object):
     """
@@ -1251,7 +1261,6 @@ class LogAdapter(logging.LoggerAdapter, object):
     def __init__(self, logger, server):
         logging.LoggerAdapter.__init__(self, logger, {})
         self.server = server
-        setattr(self, 'warn', self.warning)
 
     @property
     def txn_id(self):
@@ -1306,13 +1315,10 @@ class LogAdapter(logging.LoggerAdapter, object):
         _junk, exc, _junk = sys.exc_info()
         call = self.error
         emsg = ''
-        if isinstance(exc, OSError):
+        if isinstance(exc, (OSError, socket.error)):
             if exc.errno in (errno.EIO, errno.ENOSPC):
                 emsg = str(exc)
-            else:
-                call = self._exception
-        elif isinstance(exc, socket.error):
-            if exc.errno == errno.ECONNREFUSED:
+            elif exc.errno == errno.ECONNREFUSED:
                 emsg = _('Connection refused')
             elif exc.errno == errno.EHOSTUNREACH:
                 emsg = _('Host unreachable')
@@ -1398,7 +1404,7 @@ class SwiftLogFormatter(logging.Formatter):
                 record.exc_text = self.formatException(
                     record.exc_info).replace('\n', '#012')
         if record.exc_text:
-            if msg[-3:] != '#012':
+            if not msg.endswith('#012'):
                 msg = msg + '#012'
             msg = msg + record.exc_text
 
@@ -1414,7 +1420,7 @@ class SwiftLogFormatter(logging.Formatter):
             if self.max_line_length < 7:
                 msg = msg[:self.max_line_length]
             else:
-                approxhalf = (self.max_line_length - 5) / 2
+                approxhalf = (self.max_line_length - 5) // 2
                 msg = msg[:approxhalf] + " ... " + msg[-approxhalf:]
         return msg
 
@@ -1536,31 +1542,6 @@ def get_logger(conf, name=None, log_to_console=False, log_route=None,
             except ValueError:
                 print('Invalid custom handler format [%s]' % hook,
                       file=sys.stderr)
-
-    # Python 2.6 has the undesirable property of keeping references to all log
-    # handlers around forever in logging._handlers and logging._handlerList.
-    # Combine that with handlers that keep file descriptors, and you get an fd
-    # leak.
-    #
-    # And no, we can't share handlers; a SyslogHandler has a socket, and if
-    # two greenthreads end up logging at the same time, you could get message
-    # overlap that garbles the logs and makes eventlet complain.
-    #
-    # Python 2.7 uses weakrefs to avoid the leak, so let's do that too.
-    if sys.version_info[0] == 2 and sys.version_info[1] <= 6:
-        try:
-            logging._acquireLock()  # some thread-safety thing
-            for handler in adapted_logger.logger.handlers:
-                if handler in logging._handlers:
-                    wr = LoggingHandlerWeakRef(handler)
-                    del logging._handlers[handler]
-                    logging._handlers[wr] = 1
-                for i, handler_ref in enumerate(logging._handlerList):
-                    if handler_ref is handler:
-                        logging._handlerList[i] = LoggingHandlerWeakRef(
-                            handler)
-        finally:
-            logging._releaseLock()
 
     return adapted_logger
 
@@ -1711,7 +1692,7 @@ def expand_ipv6(address):
 def whataremyips(bind_ip=None):
     """
     Get "our" IP addresses ("us" being the set of services configured by
-    one *.conf file). If our REST listens on a specific address, return it.
+    one `*.conf` file). If our REST listens on a specific address, return it.
     Otherwise, if listen on '0.0.0.0' or '::' return all addresses, including
     the loopback.
 
@@ -2057,6 +2038,9 @@ def search_tree(root, glob_match, ext='', exts=None, dir_ext=None):
     :param glob_match: glob to match in root, matching dirs are traversed with
                        os.walk
     :param ext: only files that end in ext will be returned
+    :param exts: a list of file extensions; only files that end in one of these
+                 extensions will be returned; if set this list overrides any
+                 extension specified using the 'ext' param.
     :param dir_ext: if present directories that end with dir_ext will not be
                     traversed and instead will be returned as a matched path
 
@@ -2267,6 +2251,7 @@ class GreenAsyncPile(object):
             size = size_or_pool
         self._responses = eventlet.queue.LightQueue(size)
         self._inflight = 0
+        self._pending = 0
 
     def _run_func(self, func, args, kwargs):
         try:
@@ -2278,6 +2263,7 @@ class GreenAsyncPile(object):
         """
         Spawn a job in a green thread on the pile.
         """
+        self._pending += 1
         self._inflight += 1
         self._pool.spawn(self._run_func, func, args, kwargs)
 
@@ -2302,12 +2288,13 @@ class GreenAsyncPile(object):
 
     def next(self):
         try:
-            return self._responses.get_nowait()
-        except Empty:
+            rv = self._responses.get_nowait()
+        except eventlet.queue.Empty:
             if self._inflight == 0:
                 raise StopIteration()
-            else:
-                return self._responses.get()
+            rv = self._responses.get()
+        self._pending -= 1
+        return rv
 
 
 class ModifiedParseResult(ParseResult):
@@ -2699,13 +2686,40 @@ def rsync_ip(ip):
         return '[%s]' % ip
 
 
+def rsync_module_interpolation(template, device):
+    """
+    Interpolate devices variables inside a rsync module template
+
+    :param template: rsync module template as a string
+    :param device: a device from a ring
+
+    :returns: a string with all variables replaced by device attributes
+    """
+    replacements = {
+        'ip': rsync_ip(device.get('ip', '')),
+        'port': device.get('port', ''),
+        'replication_ip': rsync_ip(device.get('replication_ip', '')),
+        'replication_port': device.get('replication_port', ''),
+        'region': device.get('region', ''),
+        'zone': device.get('zone', ''),
+        'device': device.get('device', ''),
+        'meta': device.get('meta', ''),
+    }
+    try:
+        module = template.format(**replacements)
+    except KeyError as e:
+        raise ValueError('Cannot interpolate rsync_module, invalid variable: '
+                         '%s' % e)
+    return module
+
+
 def get_valid_utf8_str(str_or_unicode):
     """
     Get valid parts of utf-8 str from str, unicode and even invalid utf-8 str
 
     :param str_or_unicode: a string or an unicode which can be invalid utf-8
     """
-    if isinstance(str_or_unicode, unicode):
+    if isinstance(str_or_unicode, six.text_type):
         (str_or_unicode, _len) = utf8_encoder(str_or_unicode, 'replace')
     (valid_utf8_str, _len) = utf8_decoder(str_or_unicode, 'replace')
     return valid_utf8_str.encode('utf-8')
@@ -2926,8 +2940,8 @@ class ThreadPool(object):
 
     def __init__(self, nthreads=2):
         self.nthreads = nthreads
-        self._run_queue = Queue()
-        self._result_queue = Queue()
+        self._run_queue = stdlib_queue.Queue()
+        self._result_queue = stdlib_queue.Queue()
         self._threads = []
         self._alive = True
 
@@ -2952,7 +2966,7 @@ class ThreadPool(object):
         # multiple instances instantiated. Since the object server uses one
         # pool per disk, we have to reimplement this stuff.
         _raw_rpipe, self.wpipe = os.pipe()
-        self.rpipe = greenio.GreenPipe(_raw_rpipe, 'rb', bufsize=0)
+        self.rpipe = greenio.GreenPipe(_raw_rpipe, 'rb')
 
         for _junk in range(nthreads):
             thr = stdlib_threading.Thread(
@@ -3007,7 +3021,7 @@ class ThreadPool(object):
             while True:
                 try:
                     ev, success, result = queue.get(block=False)
-                except Empty:
+                except stdlib_queue.Empty:
                     break
 
                 try:
@@ -3020,15 +3034,15 @@ class ThreadPool(object):
 
     def run_in_thread(self, func, *args, **kwargs):
         """
-        Runs func(*args, **kwargs) in a thread. Blocks the current greenlet
+        Runs ``func(*args, **kwargs)`` in a thread. Blocks the current greenlet
         until results are available.
 
         Exceptions thrown will be reraised in the calling thread.
 
         If the threadpool was initialized with nthreads=0, it invokes
-        func(*args, **kwargs) directly, followed by eventlet.sleep() to ensure
-        the eventlet hub has a chance to execute. It is more likely the hub
-        will be invoked when queuing operations to an external thread.
+        ``func(*args, **kwargs)`` directly, followed by eventlet.sleep() to
+        ensure the eventlet hub has a chance to execute. It is more likely the
+        hub will be invoked when queuing operations to an external thread.
 
         :returns: result of calling func
         :raises: whatever func raises
@@ -3068,7 +3082,7 @@ class ThreadPool(object):
 
     def force_run_in_thread(self, func, *args, **kwargs):
         """
-        Runs func(*args, **kwargs) in a thread. Blocks the current greenlet
+        Runs ``func(*args, **kwargs)`` in a thread. Blocks the current greenlet
         until results are available.
 
         Exceptions thrown will be reraised in the calling thread.
@@ -3299,7 +3313,10 @@ class _MultipartMimeFileLikeObject(object):
         if len(self.input_buffer) < length + len(self.boundary) + 2:
             to_read = length + len(self.boundary) + 2
             while to_read > 0:
-                chunk = self.wsgi_input.read(to_read)
+                try:
+                    chunk = self.wsgi_input.read(to_read)
+                except (IOError, ValueError) as e:
+                    raise swift.common.exceptions.ChunkReadError(str(e))
                 to_read -= len(chunk)
                 self.input_buffer += chunk
                 if not chunk:
@@ -3325,7 +3342,10 @@ class _MultipartMimeFileLikeObject(object):
             return ''
         boundary_pos = newline_pos = -1
         while newline_pos < 0 and boundary_pos < 0:
-            chunk = self.wsgi_input.read(self.read_chunk_size)
+            try:
+                chunk = self.wsgi_input.read(self.read_chunk_size)
+            except (IOError, ValueError) as e:
+                raise swift.common.exceptions.ChunkReadError(str(e))
             self.input_buffer += chunk
             newline_pos = self.input_buffer.find('\r\n')
             boundary_pos = self.input_buffer.find(self.boundary)
@@ -3366,9 +3386,12 @@ def iter_multipart_mime_documents(wsgi_input, boundary, read_chunk_size=4096):
     """
     boundary = '--' + boundary
     blen = len(boundary) + 2  # \r\n
-    got = wsgi_input.readline(blen)
-    while got == '\r\n':
+    try:
         got = wsgi_input.readline(blen)
+        while got == '\r\n':
+            got = wsgi_input.readline(blen)
+    except (IOError, ValueError) as e:
+        raise swift.common.exceptions.ChunkReadError(str(e))
 
     if got.strip() != boundary:
         raise swift.common.exceptions.MimeInvalid(
@@ -3382,6 +3405,29 @@ def iter_multipart_mime_documents(wsgi_input, boundary, read_chunk_size=4096):
         yield it
         done = it.no_more_files
         input_buffer = it.input_buffer
+
+
+def parse_mime_headers(doc_file):
+    """
+    Takes a file-like object containing a MIME document and returns a
+    HeaderKeyDict containing the headers. The body of the message is not
+    consumed: the position in doc_file is left at the beginning of the body.
+
+    This function was inspired by the Python standard library's
+    http.client.parse_headers.
+
+    :param doc_file: binary file-like object containing a MIME document
+    :returns: a swift.common.swob.HeaderKeyDict containing the headers
+    """
+    from swift.common.swob import HeaderKeyDict  # avoid circular import
+    headers = []
+    while True:
+        line = doc_file.readline()
+        headers.append(line)
+        if line in (b'\r\n', b'\n', b''):
+            break
+    header_string = b''.join(headers)
+    return HeaderKeyDict(email.parser.Parser().parsestr(header_string))
 
 
 def mime_to_document_iters(input_file, boundary, read_chunk_size=4096):
@@ -3398,8 +3444,29 @@ def mime_to_document_iters(input_file, boundary, read_chunk_size=4096):
                                               read_chunk_size)
     for i, doc_file in enumerate(doc_files):
         # this consumes the headers and leaves just the body in doc_file
-        headers = rfc822.Message(doc_file, 0)
+        headers = parse_mime_headers(doc_file)
         yield (headers, doc_file)
+
+
+def maybe_multipart_byteranges_to_document_iters(app_iter, content_type):
+    """
+    Takes an iterator that may or may not contain a multipart MIME document
+    as well as content type and returns an iterator of body iterators.
+
+    :param app_iter: iterator that may contain a multipart MIME document
+    :param content_type: content type of the app_iter, used to determine
+                         whether it conains a multipart document and, if
+                         so, what the boundary is between documents
+    """
+    content_type, params_list = parse_content_type(content_type)
+    if content_type != 'multipart/byteranges':
+        yield app_iter
+        return
+
+    body_file = FileLikeIter(app_iter)
+    boundary = dict(params_list)['boundary']
+    for _headers, body in mime_to_document_iters(body_file, boundary):
+        yield (chunk for chunk in iter(lambda: body.read(65536), ''))
 
 
 def document_iters_to_multipart_byteranges(ranges_iter, boundary):
@@ -3493,7 +3560,8 @@ def document_iters_to_http_response_body(ranges_iter, boundary, multipart,
             except StopIteration:
                 pass
             else:
-                logger.warn("More than one part in a single-part response?")
+                logger.warning(
+                    "More than one part in a single-part response?")
 
         return string_along(response_body_iter, ranges_iter, logger)
 
@@ -3513,7 +3581,7 @@ def multipart_byteranges_to_document_iters(input_file, boundary,
     for headers, body in mime_to_document_iters(input_file, boundary,
                                                 read_chunk_size):
         first_byte, last_byte, length = parse_content_range(
-            headers.getheader('content-range'))
+            headers.get('content-range'))
         yield (first_byte, last_byte, length, headers.items(), body)
 
 

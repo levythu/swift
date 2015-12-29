@@ -31,7 +31,8 @@ import swift.common.db
 from swift.common.direct_client import quote
 from swift.common.utils import get_logger, whataremyips, storage_directory, \
     renamer, mkdirs, lock_parent_directory, config_true_value, \
-    unlink_older_than, dump_recon_cache, rsync_ip, ismount, json, Timestamp
+    unlink_older_than, dump_recon_cache, rsync_module_interpolation, ismount, \
+    json, Timestamp
 from swift.common import ring
 from swift.common.ring.utils import is_local_device
 from swift.common.http import HTTP_NOT_FOUND, HTTP_INSUFFICIENT_STORAGE
@@ -165,11 +166,20 @@ class Replicator(Daemon):
         self.max_diffs = int(conf.get('max_diffs') or 100)
         self.interval = int(conf.get('interval') or
                             conf.get('run_pause') or 30)
-        self.vm_test_mode = config_true_value(conf.get('vm_test_mode', 'no'))
-        self.node_timeout = int(conf.get('node_timeout', 10))
+        self.node_timeout = float(conf.get('node_timeout', 10))
         self.conn_timeout = float(conf.get('conn_timeout', 0.5))
         self.rsync_compress = config_true_value(
             conf.get('rsync_compress', 'no'))
+        self.rsync_module = conf.get('rsync_module', '').rstrip('/')
+        if not self.rsync_module:
+            self.rsync_module = '{replication_ip}::%s' % self.server_type
+            if config_true_value(conf.get('vm_test_mode', 'no')):
+                self.logger.warn('Option %(type)s-replicator/vm_test_mode is '
+                                 'deprecated and will be removed in a future '
+                                 'version. Update your configuration to use '
+                                 'option %(type)s-replicator/rsync_module.'
+                                 % {'type': self.server_type})
+                self.rsync_module += '{replication_port}'
         self.reclaim_age = float(conf.get('reclaim_age', 86400 * 7))
         swift.common.db.DB_PREALLOCATION = \
             config_true_value(conf.get('db_preallocation', 'f'))
@@ -187,7 +197,8 @@ class Replicator(Daemon):
         self.stats = {'attempted': 0, 'success': 0, 'failure': 0, 'ts_repl': 0,
                       'no_change': 0, 'hashmatch': 0, 'rsync': 0, 'diff': 0,
                       'remove': 0, 'empty': 0, 'remote_merge': 0,
-                      'start': time.time(), 'diff_capped': 0}
+                      'start': time.time(), 'diff_capped': 0,
+                      'failure_nodes': {}}
 
     def _report_stats(self):
         """Report the current stats to the logs."""
@@ -211,6 +222,13 @@ class Replicator(Daemon):
                          self.stats.items() if item[0] in
                          ('no_change', 'hashmatch', 'rsync', 'diff', 'ts_repl',
                           'empty', 'diff_capped')]))
+
+    def _add_failure_stats(self, failure_devs_info):
+        for node, dev in failure_devs_info:
+            self.stats['failure'] += 1
+            failure_devs = self.stats['failure_nodes'].setdefault(node, {})
+            failure_devs.setdefault(dev, 0)
+            failure_devs[dev] += 1
 
     def _rsync_file(self, db_file, remote_file, whole_file=True,
                     different_region=False):
@@ -259,14 +277,9 @@ class Replicator(Daemon):
         :param different_region: if True, the destination node is in a
                                  different region
         """
-        device_ip = rsync_ip(device['replication_ip'])
-        if self.vm_test_mode:
-            remote_file = '%s::%s%s/%s/tmp/%s' % (
-                device_ip, self.server_type, device['replication_port'],
-                device['device'], local_id)
-        else:
-            remote_file = '%s::%s/%s/tmp/%s' % (
-                device_ip, self.server_type, device['device'], local_id)
+        rsync_module = rsync_module_interpolation(self.rsync_module, device)
+        rsync_path = '%s/tmp/%s' % (device['device'], local_id)
+        remote_file = '%s/%s' % (rsync_module, rsync_path)
         mtime = os.path.getmtime(broker.db_file)
         if not self._rsync_file(broker.db_file, remote_file,
                                 different_region=different_region):
@@ -421,8 +434,12 @@ class Replicator(Daemon):
             if self._in_sync(rinfo, info, broker, local_sync):
                 return True
             # if the difference in rowids between the two differs by
-            # more than 50%, rsync then do a remote merge.
-            if rinfo['max_row'] / float(info['max_row']) < 0.5:
+            # more than 50% and the difference is greater than per_diff,
+            # rsync then do a remote merge.
+            # NOTE: difference > per_diff stops us from dropping to rsync
+            # on smaller containers, who have only a few rows to sync.
+            if rinfo['max_row'] / float(info['max_row']) < 0.5 and \
+                    info['max_row'] - rinfo['max_row'] > self.per_diff:
                 self.stats['remote_merge'] += 1
                 self.logger.increment('remote_merges')
                 return self._rsync_db(broker, node, http, info['id'],
@@ -479,7 +496,10 @@ class Replicator(Daemon):
                 quarantine_db(broker.db_file, broker.db_type)
             else:
                 self.logger.exception(_('ERROR reading db %s'), object_file)
-            self.stats['failure'] += 1
+            nodes = self.ring.get_part_nodes(int(partition))
+            self._add_failure_stats([(failure_dev['replication_ip'],
+                                      failure_dev['device'])
+                                     for failure_dev in nodes])
             self.logger.increment('failures')
             return
         # The db is considered deleted if the delete_timestamp value is greater
@@ -494,6 +514,7 @@ class Replicator(Daemon):
             self.logger.timing_since('timing', start_time)
             return
         responses = []
+        failure_devs_info = set()
         nodes = self.ring.get_part_nodes(int(partition))
         local_dev = None
         for node in nodes:
@@ -532,7 +553,8 @@ class Replicator(Daemon):
                 self.logger.exception(_('ERROR syncing %(file)s with node'
                                         ' %(node)s'),
                                       {'file': object_file, 'node': node})
-            self.stats['success' if success else 'failure'] += 1
+            if not success:
+                failure_devs_info.add((node['replication_ip'], node['device']))
             self.logger.increment('successes' if success else 'failures')
             responses.append(success)
         try:
@@ -543,7 +565,17 @@ class Replicator(Daemon):
         if not shouldbehere and all(responses):
             # If the db shouldn't be on this node and has been successfully
             # synced to all of its peers, it can be removed.
-            self.delete_db(broker)
+            if not self.delete_db(broker):
+                failure_devs_info.update(
+                    [(failure_dev['replication_ip'], failure_dev['device'])
+                     for failure_dev in repl_nodes])
+
+        target_devs_info = set([(target_dev['replication_ip'],
+                                 target_dev['device'])
+                                for target_dev in repl_nodes])
+        self.stats['success'] += len(target_devs_info - failure_devs_info)
+        self._add_failure_stats(failure_devs_info)
+
         self.logger.timing_since('timing', start_time)
 
     def delete_db(self, broker):
@@ -558,9 +590,11 @@ class Replicator(Daemon):
             if err.errno not in (errno.ENOENT, errno.ENOTEMPTY):
                 self.logger.exception(
                     _('ERROR while trying to clean up %s') % suf_dir)
+                return False
         self.stats['remove'] += 1
         device_name = self.extract_device(object_file)
         self.logger.increment('removes.' + device_name)
+        return True
 
     def extract_device(self, object_file):
         """
@@ -586,13 +620,19 @@ class Replicator(Daemon):
             self.logger.error(_('ERROR Failed to get my own IPs?'))
             return
         self._local_device_ids = set()
+        found_local = False
         for node in self.ring.devs:
             if node and is_local_device(ips, self.port,
                                         node['replication_ip'],
                                         node['replication_port']):
+                found_local = True
                 if self.mount_check and not ismount(
                         os.path.join(self.root, node['device'])):
-                    self.logger.warn(
+                    self._add_failure_stats(
+                        [(failure_dev['replication_ip'],
+                          failure_dev['device'])
+                         for failure_dev in self.ring.devs if failure_dev])
+                    self.logger.warning(
                         _('Skipping %(device)s as it is not mounted') % node)
                     continue
                 unlink_older_than(
@@ -602,6 +642,10 @@ class Replicator(Daemon):
                 if os.path.isdir(datadir):
                     self._local_device_ids.add(node['id'])
                     dirs.append((datadir, node['id']))
+        if not found_local:
+            self.logger.error("Can't find itself %s with port %s in ring "
+                              "file, not replicating",
+                              ", ".join(ips), self.port)
         self.logger.info(_('Beginning replication run'))
         for part, object_file, node_id in roundrobin_datadirs(dirs):
             self.cpool.spawn_n(

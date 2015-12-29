@@ -14,8 +14,9 @@ from __future__ import print_function
 import itertools
 import os
 import sqlite3
-import urllib
 from hashlib import md5
+
+from six.moves import urllib
 
 from swift.common.utils import hash_path, storage_directory, \
     Timestamp
@@ -100,7 +101,7 @@ def print_ring_locations(ring, datadir, account, container=None, obj=None,
     for node in primary_nodes:
         cmd = 'curl -I -XHEAD "http://%s:%s/%s/%s/%s"' \
             % (node['ip'], node['port'], node['device'], part,
-               urllib.quote(target))
+               urllib.parse.quote(target))
         if policy_index is not None:
             cmd += ' -H "%s: %s"' % ('X-Backend-Storage-Policy-Index',
                                      policy_index)
@@ -108,7 +109,7 @@ def print_ring_locations(ring, datadir, account, container=None, obj=None,
     for node in handoff_nodes:
         cmd = 'curl -I -XHEAD "http://%s:%s/%s/%s/%s"' \
             % (node['ip'], node['port'], node['device'], part,
-               urllib.quote(target))
+               urllib.parse.quote(target))
         if policy_index is not None:
             cmd += ' -H "%s: %s"' % ('X-Backend-Storage-Policy-Index',
                                      policy_index)
@@ -365,7 +366,8 @@ def print_obj(datafile, check_etag=True, swift_dir='/etc/swift',
     datadir = DATADIR_BASE
 
     # try to extract policy index from datafile disk path
-    policy_index = int(extract_policy(datafile) or POLICIES.legacy)
+    fullpath = os.path.abspath(datafile)
+    policy_index = int(extract_policy(fullpath) or POLICIES.legacy)
 
     try:
         if policy_index:

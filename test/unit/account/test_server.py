@@ -19,22 +19,24 @@ import mock
 import unittest
 from tempfile import mkdtemp
 from shutil import rmtree
-from StringIO import StringIO
 from time import gmtime
 from test.unit import FakeLogger
 import itertools
 import random
 
-import simplejson
+import json
+from six import BytesIO
+from six import StringIO
 import xml.dom.minidom
 
 from swift import __version__ as swift_version
-from swift.common.swob import Request
+from swift.common.swob import (Request, WsgiBytesIO, HTTPNoContent)
 from swift.common import constraints
 from swift.account.server import AccountController
-from swift.common.utils import normalize_timestamp, replication, public
+from swift.common.utils import (normalize_timestamp, replication, public,
+                                mkdirs, storage_directory)
 from swift.common.request_helpers import get_sys_meta_prefix
-from test.unit import patch_policies
+from test.unit import patch_policies, debug_logger
 from swift.common.storage_policy import StoragePolicy, POLICIES
 
 
@@ -62,13 +64,13 @@ class TestAccountController(unittest.TestCase):
         req = Request.blank('/sda1/p/a/c/o', {'REQUEST_METHOD': 'OPTIONS'})
         req.content_length = 0
         resp = server_handler.OPTIONS(req)
-        self.assertEquals(200, resp.status_int)
+        self.assertEqual(200, resp.status_int)
         for verb in 'OPTIONS GET POST PUT DELETE HEAD REPLICATE'.split():
             self.assertTrue(
                 verb in resp.headers['Allow'].split(', '))
-        self.assertEquals(len(resp.headers['Allow'].split(', ')), 7)
-        self.assertEquals(resp.headers['Server'],
-                          (server_handler.server_type + '/' + swift_version))
+        self.assertEqual(len(resp.headers['Allow'].split(', ')), 7)
+        self.assertEqual(resp.headers['Server'],
+                         (server_handler.server_type + '/' + swift_version))
 
     def test_DELETE_not_found(self):
         req = Request.blank('/sda1/p/a', environ={'REQUEST_METHOD': 'DELETE',
@@ -153,6 +155,49 @@ class TestAccountController(unittest.TestCase):
                                       'HTTP_X_TIMESTAMP': '1'})
         resp = req.get_response(self.controller)
         self.assertEqual(resp.status_int, 507)
+
+    def test_REPLICATE_insufficient_storage(self):
+        conf = {'devices': self.testdir, 'mount_check': 'true'}
+        self.account_controller = AccountController(conf)
+
+        def fake_check_mount(*args, **kwargs):
+            return False
+
+        with mock.patch("swift.common.constraints.check_mount",
+                        fake_check_mount):
+            req = Request.blank('/sda1/p/suff',
+                                environ={'REQUEST_METHOD': 'REPLICATE'},
+                                headers={})
+            resp = req.get_response(self.account_controller)
+        self.assertEqual(resp.status_int, 507)
+
+    def test_REPLICATE_works(self):
+        mkdirs(os.path.join(self.testdir, 'sda1', 'account', 'p', 'a', 'a'))
+        db_file = os.path.join(self.testdir, 'sda1',
+                               storage_directory('account', 'p', 'a'),
+                               'a' + '.db')
+        open(db_file, 'w')
+
+        def fake_rsync_then_merge(self, drive, db_file, args):
+            return HTTPNoContent()
+
+        with mock.patch("swift.common.db_replicator.ReplicatorRpc."
+                        "rsync_then_merge", fake_rsync_then_merge):
+            req = Request.blank('/sda1/p/a/',
+                                environ={'REQUEST_METHOD': 'REPLICATE'},
+                                headers={})
+            json_string = '["rsync_then_merge", "a.db"]'
+            inbuf = WsgiBytesIO(json_string)
+            req.environ['wsgi.input'] = inbuf
+            resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 204)
+
+        # check valuerror
+        wsgi_input_valuerror = '["sync" : sync, "-1"]'
+        inbuf1 = WsgiBytesIO(wsgi_input_valuerror)
+        req.environ['wsgi.input'] = inbuf1
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 400)
 
     def test_HEAD_not_found(self):
         # Test the case in which account does not exist (can be recreated)
@@ -394,7 +439,7 @@ class TestAccountController(unittest.TestCase):
         req = Request.blank('/sda1/p/a', environ={'REQUEST_METHOD': 'GET'})
         resp = req.get_response(self.controller)
         self.assertEqual(resp.status_int, 204)
-        self.assert_('x-account-meta-test' not in resp.headers)
+        self.assertTrue('x-account-meta-test' not in resp.headers)
 
     def test_PUT_GET_sys_metadata(self):
         prefix = get_sys_meta_prefix('account')
@@ -455,7 +500,7 @@ class TestAccountController(unittest.TestCase):
         req = Request.blank('/sda1/p/a', environ={'REQUEST_METHOD': 'GET'})
         resp = req.get_response(self.controller)
         self.assertEqual(resp.status_int, 204)
-        self.assert_(hdr not in resp.headers)
+        self.assertTrue(hdr not in resp.headers)
 
     def test_PUT_invalid_partition(self):
         req = Request.blank('/sda1/./a', environ={'REQUEST_METHOD': 'PUT',
@@ -519,7 +564,7 @@ class TestAccountController(unittest.TestCase):
         req = Request.blank('/sda1/p/a', environ={'REQUEST_METHOD': 'HEAD'})
         resp = req.get_response(self.controller)
         self.assertEqual(resp.status_int, 204)
-        self.assert_('x-account-meta-test' not in resp.headers)
+        self.assertTrue('x-account-meta-test' not in resp.headers)
 
     def test_POST_HEAD_sys_metadata(self):
         prefix = get_sys_meta_prefix('account')
@@ -572,7 +617,7 @@ class TestAccountController(unittest.TestCase):
         req = Request.blank('/sda1/p/a', environ={'REQUEST_METHOD': 'HEAD'})
         resp = req.get_response(self.controller)
         self.assertEqual(resp.status_int, 204)
-        self.assert_(hdr not in resp.headers)
+        self.assertTrue(hdr not in resp.headers)
 
     def test_POST_invalid_partition(self):
         req = Request.blank('/sda1/./a', environ={'REQUEST_METHOD': 'POST',
@@ -598,11 +643,11 @@ class TestAccountController(unittest.TestCase):
         req = Request.blank('/sda1/p/a', environ={'REQUEST_METHOD': 'PUT',
                                                   'HTTP_X_TIMESTAMP': '0'})
         resp = req.get_response(self.controller)
-        self.assertEquals(resp.status_int, 201)
+        self.assertEqual(resp.status_int, 201)
         req = Request.blank('/sda1/p/a', environ={'REQUEST_METHOD': 'DELETE',
                                                   'HTTP_X_TIMESTAMP': '1'})
         resp = req.get_response(self.controller)
-        self.assertEquals(resp.status_int, 204)
+        self.assertEqual(resp.status_int, 204)
         req = Request.blank('/sda1/p/a', environ={'REQUEST_METHOD': 'POST',
                                                   'HTTP_X_TIMESTAMP': '2'})
         resp = req.get_response(self.controller)
@@ -761,7 +806,7 @@ class TestAccountController(unittest.TestCase):
                             environ={'REQUEST_METHOD': 'GET'})
         resp = req.get_response(self.controller)
         self.assertEqual(resp.status_int, 200)
-        self.assertEqual(simplejson.loads(resp.body),
+        self.assertEqual(json.loads(resp.body),
                          [{'count': 0, 'bytes': 0, 'name': 'c1'},
                           {'count': 0, 'bytes': 0, 'name': 'c2'}])
         req = Request.blank('/sda1/p/a/c1', environ={'REQUEST_METHOD': 'PUT'},
@@ -782,7 +827,7 @@ class TestAccountController(unittest.TestCase):
                             environ={'REQUEST_METHOD': 'GET'})
         resp = req.get_response(self.controller)
         self.assertEqual(resp.status_int, 200)
-        self.assertEqual(simplejson.loads(resp.body),
+        self.assertEqual(json.loads(resp.body),
                          [{'count': 1, 'bytes': 2, 'name': 'c1'},
                           {'count': 3, 'bytes': 4, 'name': 'c2'}])
         self.assertEqual(resp.content_type, 'application/json')
@@ -986,7 +1031,7 @@ class TestAccountController(unittest.TestCase):
                             environ={'REQUEST_METHOD': 'GET'})
         resp = req.get_response(self.controller)
         self.assertEqual(resp.status_int, 200)
-        self.assertEqual(simplejson.loads(resp.body),
+        self.assertEqual(json.loads(resp.body),
                          [{'count': 2, 'bytes': 3, 'name': 'c0'},
                           {'count': 2, 'bytes': 3, 'name': 'c1'},
                           {'count': 2, 'bytes': 3, 'name': 'c2'}])
@@ -994,7 +1039,7 @@ class TestAccountController(unittest.TestCase):
                             environ={'REQUEST_METHOD': 'GET'})
         resp = req.get_response(self.controller)
         self.assertEqual(resp.status_int, 200)
-        self.assertEqual(simplejson.loads(resp.body),
+        self.assertEqual(json.loads(resp.body),
                          [{'count': 2, 'bytes': 3, 'name': 'c3'},
                           {'count': 2, 'bytes': 3, 'name': 'c4'}])
 
@@ -1094,7 +1139,7 @@ class TestAccountController(unittest.TestCase):
         req = Request.blank('/sda1/p/a', environ={'REQUEST_METHOD': 'PUT',
                                                   'HTTP_X_TIMESTAMP': '0'})
         resp = req.get_response(self.controller)
-        self.assertEquals(resp.status_int, 201)
+        self.assertEqual(resp.status_int, 201)
         req = Request.blank('/sda1/p/a/c1', environ={'REQUEST_METHOD': 'PUT'},
                             headers={'X-Put-Timestamp': '1',
                                      'X-Delete-Timestamp': '0',
@@ -1102,12 +1147,12 @@ class TestAccountController(unittest.TestCase):
                                      'X-Bytes-Used': '0',
                                      'X-Timestamp': normalize_timestamp(0)})
         resp = req.get_response(self.controller)
-        self.assertEquals(resp.status_int, 201)
+        self.assertEqual(resp.status_int, 201)
         req = Request.blank('/sda1/p/a', environ={'REQUEST_METHOD': 'GET'})
         req.accept = 'application/*'
         resp = req.get_response(self.controller)
         self.assertEqual(resp.status_int, 200)
-        self.assertEqual(len(simplejson.loads(resp.body)), 1)
+        self.assertEqual(len(json.loads(resp.body)), 1)
 
     def test_GET_accept_json(self):
         req = Request.blank('/sda1/p/a', environ={'REQUEST_METHOD': 'PUT',
@@ -1124,7 +1169,7 @@ class TestAccountController(unittest.TestCase):
         req.accept = 'application/json'
         resp = req.get_response(self.controller)
         self.assertEqual(resp.status_int, 200)
-        self.assertEqual(len(simplejson.loads(resp.body)), 1)
+        self.assertEqual(len(json.loads(resp.body)), 1)
 
     def test_GET_accept_xml(self):
         req = Request.blank('/sda1/p/a', environ={'REQUEST_METHOD': 'PUT',
@@ -1260,14 +1305,14 @@ class TestAccountController(unittest.TestCase):
         resp = req.get_response(self.controller)
         self.assertEqual(resp.status_int, 200)
         self.assertEqual([n.get('name', 's:' + n.get('subdir', 'error'))
-                          for n in simplejson.loads(resp.body)], ['s:sub.'])
+                          for n in json.loads(resp.body)], ['s:sub.'])
         req = Request.blank('/sda1/p/a?prefix=sub.&delimiter=.&format=json',
                             environ={'REQUEST_METHOD': 'GET'})
         resp = req.get_response(self.controller)
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(
             [n.get('name', 's:' + n.get('subdir', 'error'))
-             for n in simplejson.loads(resp.body)],
+             for n in json.loads(resp.body)],
             ['sub.0', 's:sub.0.', 'sub.1', 's:sub.1.', 'sub.2', 's:sub.2.'])
         req = Request.blank('/sda1/p/a?prefix=sub.1.&delimiter=.&format=json',
                             environ={'REQUEST_METHOD': 'GET'})
@@ -1275,7 +1320,7 @@ class TestAccountController(unittest.TestCase):
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(
             [n.get('name', 's:' + n.get('subdir', 'error'))
-             for n in simplejson.loads(resp.body)],
+             for n in json.loads(resp.body)],
             ['sub.1.0', 'sub.1.1', 'sub.1.2'])
 
     def test_GET_prefix_delimiter_xml(self):
@@ -1358,7 +1403,7 @@ class TestAccountController(unittest.TestCase):
         self.assertEqual(resp.status_int, 507)
 
     def test_through_call(self):
-        inbuf = StringIO()
+        inbuf = BytesIO()
         errbuf = StringIO()
         outbuf = StringIO()
 
@@ -1384,7 +1429,7 @@ class TestAccountController(unittest.TestCase):
         self.assertEqual(outbuf.getvalue()[:4], '404 ')
 
     def test_through_call_invalid_path(self):
-        inbuf = StringIO()
+        inbuf = BytesIO()
         errbuf = StringIO()
         outbuf = StringIO()
 
@@ -1410,7 +1455,7 @@ class TestAccountController(unittest.TestCase):
         self.assertEqual(outbuf.getvalue()[:4], '400 ')
 
     def test_through_call_invalid_path_utf8(self):
-        inbuf = StringIO()
+        inbuf = BytesIO()
         errbuf = StringIO()
         outbuf = StringIO()
 
@@ -1582,7 +1627,7 @@ class TestAccountController(unittest.TestCase):
     def test_correct_allowed_method(self):
         # Test correct work for allowed method using
         # swift.account.server.AccountController.__call__
-        inbuf = StringIO()
+        inbuf = BytesIO()
         errbuf = StringIO()
         outbuf = StringIO()
         self.controller = AccountController(
@@ -1621,7 +1666,7 @@ class TestAccountController(unittest.TestCase):
     def test_not_allowed_method(self):
         # Test correct work for NOT allowed method using
         # swift.account.server.AccountController.__call__
-        inbuf = StringIO()
+        inbuf = BytesIO()
         errbuf = StringIO()
         outbuf = StringIO()
         self.controller = AccountController(
@@ -1658,7 +1703,7 @@ class TestAccountController(unittest.TestCase):
             self.assertEqual(response, answer)
 
     def test_call_incorrect_replication_method(self):
-        inbuf = StringIO()
+        inbuf = BytesIO()
         errbuf = StringIO()
         outbuf = StringIO()
         self.controller = AccountController(
@@ -1686,8 +1731,54 @@ class TestAccountController(unittest.TestCase):
                    'wsgi.multiprocess': False,
                    'wsgi.run_once': False}
             self.controller(env, start_response)
-            self.assertEquals(errbuf.getvalue(), '')
-            self.assertEquals(outbuf.getvalue()[:4], '405 ')
+            self.assertEqual(errbuf.getvalue(), '')
+            self.assertEqual(outbuf.getvalue()[:4], '405 ')
+
+    def test__call__raise_timeout(self):
+        inbuf = WsgiBytesIO()
+        errbuf = StringIO()
+        outbuf = StringIO()
+        self.logger = debug_logger('test')
+        self.account_controller = AccountController(
+            {'devices': self.testdir, 'mount_check': 'false',
+             'replication_server': 'false', 'log_requests': 'false'},
+            logger=self.logger)
+
+        def start_response(*args):
+            # Sends args to outbuf
+            outbuf.writelines(args)
+
+        method = 'PUT'
+
+        env = {'REQUEST_METHOD': method,
+               'SCRIPT_NAME': '',
+               'PATH_INFO': '/sda1/p/a/c',
+               'SERVER_NAME': '127.0.0.1',
+               'SERVER_PORT': '8080',
+               'SERVER_PROTOCOL': 'HTTP/1.0',
+               'CONTENT_LENGTH': '0',
+               'wsgi.version': (1, 0),
+               'wsgi.url_scheme': 'http',
+               'wsgi.input': inbuf,
+               'wsgi.errors': errbuf,
+               'wsgi.multithread': False,
+               'wsgi.multiprocess': False,
+               'wsgi.run_once': False}
+
+        @public
+        def mock_put_method(*args, **kwargs):
+            raise Exception()
+
+        with mock.patch.object(self.account_controller, method,
+                               new=mock_put_method):
+            response = self.account_controller.__call__(env, start_response)
+            self.assertTrue(response[0].startswith(
+                'Traceback (most recent call last):'))
+            self.assertEqual(self.logger.get_lines_for_level('error'), [
+                'ERROR __call__ error with %(method)s %(path)s : ' % {
+                    'method': 'PUT', 'path': '/sda1/p/a/c'},
+            ])
+            self.assertEqual(self.logger.get_lines_for_level('info'), [])
 
     def test_GET_log_requests_true(self):
         self.controller.logger = FakeLogger()
@@ -1747,15 +1838,15 @@ class TestAccountController(unittest.TestCase):
             req = Request.blank('/sda1/p/a', method=method)
             resp = req.get_response(self.controller)
             self.assertEqual(resp.status_int // 100, 2)
-            self.assertEquals(resp.headers['X-Account-Object-Count'], '2')
-            self.assertEquals(resp.headers['X-Account-Bytes-Used'], '4')
-            self.assertEquals(
+            self.assertEqual(resp.headers['X-Account-Object-Count'], '2')
+            self.assertEqual(resp.headers['X-Account-Bytes-Used'], '4')
+            self.assertEqual(
                 resp.headers['X-Account-Storage-Policy-%s-Object-Count' %
                              POLICIES[0].name], '2')
-            self.assertEquals(
+            self.assertEqual(
                 resp.headers['X-Account-Storage-Policy-%s-Bytes-Used' %
                              POLICIES[0].name], '4')
-            self.assertEquals(
+            self.assertEqual(
                 resp.headers['X-Account-Storage-Policy-%s-Container-Count' %
                              POLICIES[0].name], '1')
 
@@ -1785,15 +1876,15 @@ class TestAccountController(unittest.TestCase):
             req = Request.blank('/sda1/p/a', method=method)
             resp = req.get_response(self.controller)
             self.assertEqual(resp.status_int // 100, 2)
-            self.assertEquals(resp.headers['X-Account-Object-Count'], '2')
-            self.assertEquals(resp.headers['X-Account-Bytes-Used'], '4')
-            self.assertEquals(
+            self.assertEqual(resp.headers['X-Account-Object-Count'], '2')
+            self.assertEqual(resp.headers['X-Account-Bytes-Used'], '4')
+            self.assertEqual(
                 resp.headers['X-Account-Storage-Policy-%s-Object-Count' %
                              policy.name], '2')
-            self.assertEquals(
+            self.assertEqual(
                 resp.headers['X-Account-Storage-Policy-%s-Bytes-Used' %
                              policy.name], '4')
-            self.assertEquals(
+            self.assertEqual(
                 resp.headers['X-Account-Storage-Policy-%s-Container-Count' %
                              policy.name], '1')
 
@@ -1810,7 +1901,7 @@ class TestAccountController(unittest.TestCase):
             resp = req.get_response(self.controller)
             self.assertEqual(resp.status_int // 100, 2)
             for key in resp.headers:
-                self.assert_('storage-policy' not in key.lower())
+                self.assertTrue('storage-policy' not in key.lower())
 
     def test_empty_except_for_used_policies(self):
         ts = itertools.count()
@@ -1826,7 +1917,7 @@ class TestAccountController(unittest.TestCase):
             resp = req.get_response(self.controller)
             self.assertEqual(resp.status_int // 100, 2)
             for key in resp.headers:
-                self.assert_('storage-policy' not in key.lower())
+                self.assertTrue('storage-policy' not in key.lower())
 
         # add a container
         policy = random.choice(POLICIES)
@@ -1847,7 +1938,7 @@ class TestAccountController(unittest.TestCase):
             self.assertEqual(resp.status_int // 100, 2)
             for key in resp.headers:
                 if 'storage-policy' in key.lower():
-                    self.assert_(policy.name.lower() in key.lower())
+                    self.assertTrue(policy.name.lower() in key.lower())
 
     def test_multiple_policies_in_use(self):
         ts = itertools.count()
